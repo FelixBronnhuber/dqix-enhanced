@@ -61,6 +61,7 @@ static int g_win2_full, g_win2_rect[4];                           /* ...fullscre
 static int g_wide_pop;                                            /* widescreen: the small screen in its own window (the field alone) */
 static int g_smooth = 0;                                          /* Enhanced: smooth (filtered) textures */
 static int g_hd2d = 0;                                            /* Enhanced: the HD-2D look (depth of field, bloom; Metal) */
+static int g_rt = 0;                                              /* Enhanced: ray-traced shadows and occlusion (Metal) */
 static int g_res_auto = 1;                                        /* 3D resolution: as sharp as the screen shows it (else g_scale3d) */
 static int g_small_opacity = 50;                                  /* widescreen: how solid the small screen over the field is (O), % */
 static int g_wide_dyn;                                            /* widescreen: 0 basic (the corner stays), 1 dynamic (experimental: slides for menus) */
@@ -406,6 +407,7 @@ static void settings_load(void) {
         else if (!strcmp(key, "widescreen_popout")) g_wide_pop = atoi(val) != 0;
         else if (!strcmp(key, "smooth_textures")) g_smooth = atoi(val) != 0;
         else if (!strcmp(key, "hd2d")) g_hd2d = atoi(val) != 0;
+        else if (!strcmp(key, "rt_lighting")) g_rt = atoi(val) != 0;
         else if (!strcmp(key, "small_screen_opacity")) { int v = atoi(val); if (v >= 10 && v <= 100) opacity_saved = v; }
         else if (!strcmp(key, "second_window")) { int r[4]; if (sscanf(val, "%d,%d,%d,%d", &r[0], &r[1], &r[2], &r[3]) == 4 && r[2] > 0 && r[3] > 0) memcpy(g_win2_rect, r, sizeof r); }
         else if (!strcmp(key, "second_window_fullscreen")) g_win2_full = atoi(val) != 0;
@@ -456,6 +458,8 @@ static void settings_save(void) {
     fprintf(f, "smooth_textures = %d\n", g_smooth);
     fprintf(f, "# enhanced: the HD-2D look (depth of field, glow, warm colours; macOS for now): 0 or 1\n");
     fprintf(f, "hd2d = %d\n", g_hd2d);
+    fprintf(f, "# enhanced: ray-traced shadows from the sun and shading in corners (macOS for now): 0 or 1\n");
+    fprintf(f, "rt_lighting = %d\n", g_rt);
     fprintf(f, "# widescreen: the small screen (map, battle commands) in a window of its own: 0 or 1\n");
     fprintf(f, "widescreen_popout = %d\n", g_wide_pop);
     fprintf(f, "# window size: 1 to 8 times the DS screens (F3)\n");
@@ -609,6 +613,8 @@ static int try_gl(void) {
     gl_set_smooth(g_smooth);
     if (getenv("DQIX_HD2D")) g_hd2d = atoi(getenv("DQIX_HD2D")) != 0;       /* tests */
     gl_set_hd2d(g_hd2d);
+    if (getenv("DQIX_RT")) g_rt = atoi(getenv("DQIX_RT")) != 0;             /* tests */
+    gl_set_rt(g_rt);
     if (!gl_render_init(g_res_auto ? (getenv("DQIX_AUTO_FROM") ? 2 : 4) : g_scale3d)) {
         fprintf(stderr, "OpenGL renderer failed to start: using the software renderer\n");
         gfx_detach(g_win); SDL_DestroyWindow(g_win); g_win = NULL; return 0;
@@ -1179,6 +1185,7 @@ static void menu_sync(void) {
     menu_check(MI_POPOUT, g_wide_pop && wide); menu_enable(MI_POPOUT, g_gl);
     menu_check(MI_SMOOTH, g_smooth); menu_enable(MI_SMOOTH, g_gl && !g_classic);
     menu_check(MI_HD2D, g_hd2d); menu_enable(MI_HD2D, g_gl && !g_classic && (gl_effects() & GL_EFFECT_HD2D));
+    menu_check(MI_RT, g_rt); menu_enable(MI_RT, g_gl && !g_classic && (gl_effects() & GL_EFFECT_RT));
     menu_check(MI_LCD, g_opt.lcd); menu_enable(MI_LCD, g_gl);
     int lcd = g_gl && g_opt.lcd;
     menu_check(MI_LCDCOL, g_opt.lcd_color); menu_enable(MI_LCDCOL, lcd);
@@ -1738,6 +1745,7 @@ static void do_action(int id) {
     case MI_RES_AUTO: if (g_gl && !g_classic) g_res_auto = 1; break;          /* auto_scale() picks it */
     case MI_SMOOTH: if (g_gl) { g_smooth = !g_smooth; gl_set_smooth(g_smooth); } break;
     case MI_HD2D: if (g_gl && (gl_effects() & GL_EFFECT_HD2D)) { g_hd2d = !g_hd2d; gl_set_hd2d(g_hd2d); } break;
+    case MI_RT: if (g_gl && (gl_effects() & GL_EFFECT_RT)) { g_rt = !g_rt; gl_set_rt(g_rt); } break;
     case MI_POPOUT:
         if (!g_gl) break;
         if (g_wide && !g_side_by_side) g_wide_pop = !g_wide_pop;

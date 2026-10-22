@@ -1317,6 +1317,7 @@ int gl_wide_shown(int* side) { *side = g_wside; return g_wide_shown; }
 /* The extra looks (gl_render.h) are Metal only for now. */
 int gl_effects(void) { return 0; }
 void gl_set_hd2d(int on) { (void)on; }
+void gl_set_rt(int on) { (void)on; }
 
 /* ---------------------------------------------------------------- windows */
 /* One context for every window: the first window's. */

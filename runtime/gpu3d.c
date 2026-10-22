@@ -14,6 +14,7 @@
  * frame is rendered at scanline 215 and shown during the next frame, read
  * line by line by the 2D engine as BG0. Without a new FLUSH the last list is
  * rendered again with the newly latched registers, like the hardware. */
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include "nds.h"
@@ -41,6 +42,7 @@ typedef struct {
     s32 fpos[2];           /* screen position */
     s32 fcol[3];           /* 9-bit colour for the rasterizer */
     s32 hpos[2];           /* screen position with 4 fractional bits (GPU renderer) */
+    float vpos[3];          /* view space, for the GPU renderer's lighting only */
 } Vtx;
 
 typedef struct {
@@ -127,6 +129,11 @@ static u32 viewport[6];
 static s32 postest[4];
 static s16 vectest[3];
 
+/* For the GPU renderer's lighting (nothing the game can see): which lights
+ * the frame's lit vertices use. */
+static u32 light_use[4];
+static float frame_sun[3], frame_sun_col[3]; static int frame_has_sun;
+
 static Vtx tmp_vtx[4];
 static u32 vtx_num, vtx_in_poly, consecutive;
 static HPoly* last_strip;
@@ -197,6 +204,8 @@ static void clip_segment(Vtx* out, const Vtx* vin, const Vtx* vout, int comp, s3
     if (comp != 2) INTERP(pos[2]);
     INTERP(pos[3]);
     out->pos[comp] = plane * out->pos[3];
+    {   float t = (float)fnum / (float)fden;
+        for (int k = 0; k < 3; k++) out->vpos[k] = vin->vpos[k] + (vout->vpos[k] - vin->vpos[k]) * t; }
     if (attribs) {
         INTERP(col[0]); INTERP(col[1]); INTERP(col[2]);
         out->tex[0] = (s16)(vin->tex[0] + ((s64)(vout->tex[0] - vin->tex[0]) * fnum) / fden);
@@ -494,6 +503,9 @@ static void submit_vertex(void) {
         t->tex[1] = (s16)(((vx * m_tex[1] + vy * m_tex[5] + vz * m_tex[9]) >> 24) + raw_tex[1]);
     } else { t->tex[0] = tex_coords[0]; t->tex[1] = tex_coords[1]; }
     t->clipped = 0;
+    if (g_renderer3d) {
+        for (int c = 0; c < 3; c++) t->vpos[c] = (float)((vx * m_pos[c] + vy * m_pos[4 + c] + vz * m_pos[8 + c] + vw * m_pos[12 + c]) >> 12) / 4096.0f;
+    }
     vtx_num++; vtx_in_poly++;
     switch (poly_mode) {
     case 0: if (vtx_in_poly == 3) { vtx_in_poly = 0; submit_polygon(); consecutive++; } break;
@@ -671,6 +683,7 @@ static void exec(uint8_t cmd, const u32* p) {
         normal[1] = (s16)((p[0] & 0x000FFC00) >> 4) >> 6;
         normal[2] = (s16)((p[0] & 0x3FF00000) >> 14) >> 6;
         calc_lighting();
+        if (g_renderer3d) for (int i = 0; i < 4; i++) if (cur_poly_attr & (1u << i)) light_use[i]++;   /* the GPU renderer's sun */
         break;
     case 0x22:
         raw_tex[0] = (s16)(p[0] & 0xFFFF); raw_tex[1] = (s16)(p[0] >> 16);
@@ -1569,6 +1582,7 @@ static void gl_frame(void) {
             o->iw = v->pos[3] ? 4096.0f / (float)v->pos[3] : 1e6f;
             o->r = v->fcol[0] / 16.0f; o->g = v->fcol[1] / 16.0f; o->b = v->fcol[2] / 16.0f;
             o->s = v->tex[0] / 16.0f; o->t = v->tex[1] / 16.0f;
+            o->vx = v->vpos[0]; o->vy = v->vpos[1]; o->vz = v->vpos[2];
             if (o->y < q->ymin) q->ymin = o->y;
             if (o->y > q->ymax) q->ymax = o->y;
         }
@@ -1580,6 +1594,8 @@ static void gl_frame(void) {
     f.order = g_gl_order; f.n = n; f.n_opaque = nop;
     f.wbuf = count ? list[0]->wbuf : 0;
     f.width = 256 + 2 * (w_render_side > 0 ? w_render_side : 0);
+    f.has_sun = frame_has_sun;
+    memcpy(f.sun, frame_sun, sizeof f.sun); memcpy(f.sun_col, frame_sun_col, sizeof f.sun_col);
     g_renderer3d->render(&f);
     g_3d_have_frame = 1;
 }
@@ -1607,6 +1623,22 @@ void gpu3d_vblank(void) {
             for (u32 i = 0; i < n_wpoly; i++) { HPoly* p = &wcur_pram[i]; if (p->translucent) wrender_list[wt++] = p; else wrender_list[wo++] = p; }
             qsort(wrender_list, (flush_attr & 1) ? n_wopaque : n_wpoly, sizeof wrender_list[0], ysort_cmp);
             wrender_n = n_wpoly;
+        }
+        if (g_renderer3d) {                                          /* the sun: the light most lit vertices used */
+            int best = -1;
+            for (int i = 0; i < 4; i++) {
+                int bright = light_col[i][0] + light_col[i][1] + light_col[i][2];
+                if (!light_use[i] || !bright) continue;
+                if (best < 0 || light_use[i] > light_use[best]) best = i;
+            }
+            frame_has_sun = best >= 0;
+            if (best >= 0) {
+                float l = 0;
+                for (int c = 0; c < 3; c++) { frame_sun[c] = (float)light_dir[best][c]; l += frame_sun[c] * frame_sun[c]; }
+                l = l > 0 ? 1.0f / sqrtf(l) : 0;
+                for (int c = 0; c < 3; c++) { frame_sun[c] *= l; frame_sun_col[c] = (float)light_col[best][c] / 31.0f; }
+            }
+            memset(light_use, 0, sizeof light_use);
         }
         static int lg = -1; if (lg < 0) lg = getenv("DQIX_SWAPLOG") != NULL;
         if (lg) fprintf(stderr, "swap %llu\n", (unsigned long long)g_frame);

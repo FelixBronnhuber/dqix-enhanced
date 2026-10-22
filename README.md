@@ -30,6 +30,9 @@ news, and friends to play with.
   colours, pixel grid, motion blur and backlight levels, and the screens
   inside a photo of a real DS Lite (or a drawn one in six colours), even at
   actual size. F6 switches the screen filter, F7 the console.
+- **HD-2D look and ray-traced lighting** (Mac, Graphics menu): depth of
+  field, glow and warm colours like the HD-2D games, and soft shadows and
+  shading in corners traced on the GPU. Both off at first.
 - Any window size, fullscreen, screens stacked or side by side, and sharp
   pixel scaling. F9 swaps the screens.
 - **Two windows**, one screen in each, for two monitors, each one

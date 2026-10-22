@@ -23,7 +23,7 @@
 #include "gpu3d.h"
 #include "gl_render.h"
 
-#define VTX_FLOATS 18                    /* floats per vertex sent to the GPU */
+#define VTX_FLOATS 21                    /* floats per vertex sent to the GPU (the last 3: view-space position) */
 
 /* ---------------------------------------------------------------- shaders */
 static const char* MSL =
@@ -32,19 +32,21 @@ static const char* MSL =
     "\n"
     /* ---- polygons */
     "struct PolyV { float4 pos [[position]]; float4 color; float2 tex; float4 attr [[flat]];\n"
-    "  float3 bary [[center_no_perspective]]; int ext [[flat]]; };\n"
+    "  float3 bary [[center_no_perspective]]; int ext [[flat]]; float3 vpos; };\n"
     "vertex PolyV vs_poly(uint vid [[vertex_id]], const device float* vb [[buffer(0)]], constant float2& texsize [[buffer(1)]]) {\n"
-    "  const device float* o = vb + vid * 18;\n"
+    "  const device float* o = vb + vid * 21;\n"
     "  PolyV r;\n"
     "  r.pos = float4(o[0], -o[1], (o[2] + o[3]) * 0.5, o[3]);\n"   /* GL's -1..1 depth -> 0..1; y flipped (see the top) */
     "  r.color = float4(o[4], o[5], o[6], o[7]); r.tex = float2(o[8], o[9]) / texsize;\n"
     "  r.attr = float4(o[10], o[11], o[12], o[13]); r.bary = float3(o[14], o[15], o[16]); r.ext = int(o[17] + 0.5);\n"
+    "  r.vpos = float3(o[18], o[19], o[20]);\n"
     "  return r; }\n"
     "struct PolyU { float4 toon[32]; float aref, edgew; int highlight, alphatest, wbuf, part, sharpa, pad; };\n"
-    "struct PolyOut { float4 color [[color(0)]]; float4 attr [[color(1)]]; float w [[color(2)]]; float depth [[depth(any)]]; };\n"
+    "struct PolyOut { float4 color [[color(0)]]; float4 attr [[color(1)]]; float4 g [[color(2)]]; float depth [[depth(any)]]; };\n"
     /* DS pixel pipeline, in 5-bit color steps like the hardware. */
     "fragment PolyOut fs_poly(PolyV in [[stage_in]], constant PolyU& u [[buffer(0)]], texture2d<float> tex [[texture(0)]], sampler smp [[sampler(0)]]) {\n"
     "  float3 gx = dfdx(in.bary), gy = dfdy(in.bary);\n"
+
     "  float3 dist = in.bary / max(sqrt(gx * gx + gy * gy), float3(1e-6));\n"
     "  float eflag = 0.0;\n"
     "  for (int k = 0; k < 3; k++) if (((in.ext >> k) & 1) != 0 && dist[k] < u.edgew) eflag = 1.0;\n"
@@ -68,7 +70,7 @@ static const char* MSL =
     "  PolyOut o;\n"
     "  o.color = float4(float3(c) / 31.0, fa);\n"
     "  o.attr = float4(in.attr.z, in.attr.w, eflag, 1.0);\n"
-    "  o.w = 1.0 / in.pos.w;\n"                                 /* distance from the eye (HD-2D: depth of field) */
+    "  o.g = float4(in.vpos, 1.0 / in.pos.w);\n"                     /* view position; distance (HD-2D: depth of field) */
     "  float d = u.wbuf != 0 ? clamp((1.0 / in.pos.w) / 4096.0, 0.0, 1.0) : in.pos.z;\n"
     "  o.depth = rint(d * 16777215.0) / 16777215.0;\n"       /* as a 24-bit depth buffer keeps it */
     "  return o; }\n"
@@ -83,11 +85,14 @@ static const char* MSL =
     "fragment float4 fs_nothing(QuadV in [[stage_in]]) { return float4(0.0); }\n"
     "\n"
     /* ---- edge marking and fog on the finished 3D frame */
-    "struct PostU { float4 edgecol[8]; float4 fogcol; float fogtab[32]; int edge, scale, aa, fog, fog_alpha_only, fogoff, fogshift, wbuf; };\n"
+    "struct PostU { float4 edgecol[8]; float4 fogcol; float fogtab[32]; int edge, scale, aa, fog, fog_alpha_only, fogoff, fogshift, wbuf; int rt, p0, p1, p2; };\n"
     "fragment float4 fs_post(QuadV in [[stage_in]], constant PostU& u [[buffer(0)]], texture2d<float> tcol [[texture(0)]],\n"
-    "                        texture2d<float> tattr [[texture(1)]], depth2d<float> tdep [[texture(2)]]) {\n"
+    "                        texture2d<float> tattr [[texture(1)]], depth2d<float> tdep [[texture(2)]], texture2d<float> tshade [[texture(3)]],\n"
+    "                        sampler ssm [[sampler(0)]]) {\n"
     "  int2 p = int2(in.pos.xy);\n"
     "  float4 c = tcol.read(uint2(p)); float4 at = tattr.read(uint2(p));\n"
+    "  if (u.rt != 0 && c.a > 0.0) { float sh = tshade.sample(ssm, (float2(p) + 0.5) / float2(tcol.get_width(), tcol.get_height())).r;\n"
+    "    c.rgb = u.rt == 2 ? float3(sh) : c.rgb * sh; }\n"   /* ray-traced shadows, occlusion */
     "  if (u.edge != 0 && at.b > 0.5 && at.a > 0.5) {\n"
     "    float id = at.r; float d = tdep.read(uint2(p));\n"
     "    int2 sz = int2(tcol.get_width(), tcol.get_height());\n"
@@ -371,7 +376,7 @@ static const char* MSL =
     "  float2 sz = float2(wd.get_width(), wd.get_height());\n"
     "  for (int j = 0; j < 3; j++) for (int i = 0; i < 5; i++) {\n"
     "    float2 t = float2(0.34 + 0.08 * float(i), 1.0 - (0.45 + 0.12 * float(j)));\n"   /* x across, y from the top */
-    "    float w = wd.read(uint2(t * sz)).r;\n"
+    "    float w = wd.read(uint2(t * sz)).a;\n"
     "    if (w < 1e8) v[n++] = w;\n"
     "  }\n"
     "  float old = prev.read(uint2(0)).r;\n"
@@ -394,7 +399,7 @@ static const char* MSL =
     "  if (c0.a <= 0.0) return c0;\n"
     "  float f = foc.read(uint2(0)).r;\n"
     "  float ytd = 1.0 - (float(p.y) + 0.5) / float(sz.y);\n"
-    "  float r0 = coc(wd.read(uint2(p)).r, f, ytd) * u.scale;\n"   /* in pixels of this texture */
+    "  float r0 = coc(wd.read(uint2(p)).a, f, ytd) * u.scale;\n"   /* in pixels of this texture */
     "  if (r0 < 0.5) return c0;\n"
     "  float3 sum = c0.rgb; float ws = 1.0;\n"
     "  for (int i = 1; i < 24; i++) {\n"                          /* a golden-angle spiral */
@@ -402,7 +407,7 @@ static const char* MSL =
     "    int2 q = clamp(p + int2(round(float2(cos(a), sin(a)) * rr)), int2(0), sz - 1);\n"
     "    float4 c = col.read(uint2(q));\n"
     "    if (c.a <= 0.0) continue;\n"
-    "    float rq = coc(wd.read(uint2(q)).r, f, 1.0 - (float(q.y) + 0.5) / float(sz.y)) * u.scale;\n"
+    "    float rq = coc(wd.read(uint2(q)).a, f, 1.0 - (float(q.y) + 0.5) / float(sz.y)) * u.scale;\n"
     "    float k = clamp(min(rq, r0) - rr + 1.0, 0.0, 1.0);\n"   /* a sharp pixel nearby doesn't spread over this one */
     "    sum += c.rgb * k; ws += k;\n"
     "  }\n"
@@ -444,10 +449,99 @@ static const char* MSL =
     "  c *= 1.0 - 0.35 * smoothstep(0.3, 0.75, length(v));\n"
     "  return float4(clamp(c, 0.0, 1.0), c0.a); }\n";
 
+/* Ray-traced shadows and occlusion: per pixel of a G-buffer (view position,
+ * normal), one ray toward the sun and a few short ones around, against the
+ * frame's own triangles; then a depth-aware blur into a shade factor. */
+static const char* MSL_RT =
+    "#include <metal_stdlib>\n"
+    "#include <metal_raytracing>\n"
+    "using namespace metal;\n"
+    "using namespace raytracing;\n"
+    "struct RtU { float4 sun; float4 sun_col; uint frame, has_sun, ratio, pad; float sun_k, ao_k, ao_r, pad2; };\n"
+    /* a cut-out triangle: its texel coordinates, where its texture's solid/see-through bits are, how it repeats */
+    "struct Cut { float s[3], t[3]; uint off, w, h, wrap; };\n"
+    "float wrap1(float x, float n, uint m) {\n"                     /* 0 clamp, 1 repeat, 2 mirrored repeat */
+    "  if (m == 0) return clamp(x, 0.0, n - 1.0);\n"
+    "  if (m == 1) return x - n * floor(x / n);\n"
+    "  float y = x - 2.0 * n * floor(x / (2.0 * n)); return y < n ? y : 2.0 * n - 1.0 - y; }\n"
+    "bool solid_at(const device Cut* cuts, const device uchar* bits, uint prim, float2 b) {\n"
+    "  Cut c = cuts[prim]; float w0 = 1.0 - b.x - b.y;\n"
+    "  float s = c.s[0] * w0 + c.s[1] * b.x + c.s[2] * b.y, t = c.t[0] * w0 + c.t[1] * b.x + c.t[2] * b.y;\n"
+    "  uint x = min(uint(wrap1(floor(s), float(c.w), c.wrap / 3)), c.w - 1), y = min(uint(wrap1(floor(t), float(c.h), c.wrap % 3)), c.h - 1);\n"
+    "  uint i = y * c.w + x;\n"
+    "  return ((bits[c.off + (i >> 3)] >> (i & 7)) & 1) != 0; }\n"
+    /* the nearest (or any, for shadows) hit, cut-outs by their texels; -1 if none */
+    "float hit(ray r, primitive_acceleration_structure as, const device Cut* cuts, const device uchar* bits, bool any) {\n"
+    "  intersection_params pr; pr.assume_geometry_type(geometry_type::triangle); pr.accept_any_intersection(any);\n"
+    "  intersection_query<triangle_data> q; q.reset(r, as, pr);\n"
+    "  while (q.next())\n"
+    "    if (q.get_candidate_intersection_type() == intersection_type::triangle &&\n"
+    "        solid_at(cuts, bits, q.get_candidate_primitive_id(), q.get_candidate_triangle_barycentric_coord())) q.commit_triangle_intersection();\n"
+    "  return q.get_committed_intersection_type() == intersection_type::triangle ? q.get_committed_distance() : -1.0; }\n"
+    "uint pcg(uint v) { uint s = v * 747796405u + 2891336453u; uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u; return (w >> 22u) ^ w; }\n"
+    "float rnd(thread uint& st) { st = pcg(st); return float(st) / 4294967296.0; }\n"
+    "float3 around(float3 n, float a, float b) {\n"                /* cosine-weighted around n */
+    "  float r = sqrt(a), ph = 6.2831853 * b;\n"
+    "  float3 t = abs(n.x) > 0.5 ? float3(0, 1, 0) : float3(1, 0, 0);\n"
+    "  float3 x = normalize(cross(t, n)), y = cross(n, x);\n"
+    "  return normalize(x * (r * cos(ph)) + y * (r * sin(ph)) + n * sqrt(max(1.0 - a, 0.0))); }\n"
+    "kernel void rt_trace(uint2 gid [[thread_position_in_grid]], constant RtU& u [[buffer(0)]],\n"
+    "                     primitive_acceleration_structure as [[buffer(1)]], const device Cut* cuts [[buffer(2)]],\n"
+    "                     const device uchar* bits [[buffer(3)]], texture2d<float> gpos [[texture(0)]],\n"
+    "                     texture2d<float, access::write> out [[texture(2)]]) {\n"
+    "  if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;\n"
+    "  uint2 src = min(gid * u.ratio + u.ratio / 2, uint2(gpos.get_width() - 1, gpos.get_height() - 1));\n"
+    "  float4 g = gpos.read(src);\n"
+    "  if (g.w >= 1e8 || g.w <= 0.0) { out.write(float4(1.0, 1.0, 0.0, 0.0), gid); return; }\n"   /* nothing drawn */
+    "  float3 p = g.xyz;\n"
+    "  int2 gs = int2(gpos.get_width(), gpos.get_height()), c = int2(src);\n"
+    "  float3 xa = gpos.read(uint2(min(c + int2(1, 0), gs - 1))).xyz - p, xb = p - gpos.read(uint2(max(c - int2(1, 0), int2(0)))).xyz;\n"
+    "  float3 ya = gpos.read(uint2(min(c + int2(0, 1), gs - 1))).xyz - p, yb = p - gpos.read(uint2(max(c - int2(0, 1), int2(0)))).xyz;\n"
+    "  float3 n = cross(abs(xa.z) < abs(xb.z) ? xa : xb, abs(ya.z) < abs(yb.z) ? ya : yb);\n"   /* the face's normal */
+    "  n = dot(n, n) > 0.0 ? normalize(n) : float3(0.0, 0.0, 1.0);\n"
+    "  if (dot(n, -p) < 0.0) n = -n;\n"
+    "  float dist = max(length(p), 1e-3), eps = dist * 0.003;\n"
+    "  uint st = pcg(gid.x * 1973u + gid.y * 9277u + u.frame * 26699u);\n"
+
+    "  float vis = 1.0, ndl = 0.0;\n"
+    "  if (u.has_sun != 0) {\n"
+    "    ndl = dot(n, u.sun.xyz);\n"
+    "    if (ndl > 0.0) {\n"
+    "      float3 d = normalize(u.sun.xyz + (float3(rnd(st), rnd(st), rnd(st)) - 0.5) * 0.06);\n"   /* a sun of some size: soft edges */
+    "      ray r; r.origin = p + n * eps; r.direction = d; r.min_distance = eps; r.max_distance = 1e7;\n"
+    "      vis = hit(r, as, cuts, bits, true) < 0.0 ? 1.0 : 0.0;\n"
+    "    }\n"
+    "  }\n"
+    "  float rad = u.ao_r * dist, occ = 0.0;\n"                     /* occlusion: as far as a fraction of the distance */
+    "  for (int k = 0; k < 4; k++) {\n"
+    "    ray r; r.origin = p + n * eps; r.direction = around(n, rnd(st), rnd(st)); r.min_distance = eps; r.max_distance = rad;\n"
+    "    float d = hit(r, as, cuts, bits, false);\n"
+    "    if (d >= 0.0) occ += 1.0 - d / rad;\n"
+    "  }\n"
+    "  out.write(float4(vis, 1.0 - occ / 4.0, max(ndl, 0.0), dist), gid); }\n"
+    "kernel void rt_blur(uint2 gid [[thread_position_in_grid]], constant RtU& u [[buffer(0)]],\n"
+    "                    texture2d<float> raw [[texture(0)]], texture2d<float, access::write> out [[texture(1)]]) {\n"
+    "  int2 sz = int2(raw.get_width(), raw.get_height());\n"
+    "  if (int(gid.x) >= sz.x || int(gid.y) >= sz.y) return;\n"
+    "  float4 c = raw.read(gid);\n"
+    "  if (c.w <= 0.0) { out.write(float4(1.0), gid); return; }\n"
+    "  float vis = 0.0, ao = 0.0, ws = 0.0;\n"
+    "  for (int j = -2; j <= 2; j++) for (int i = -2; i <= 2; i++) {\n"
+    "    int2 q = clamp(int2(gid) + int2(i, j), int2(0), sz - 1);\n"
+    "    float4 t = raw.read(uint2(q));\n"
+    "    if (t.w <= 0.0) continue;\n"
+    "    float w = exp(-abs(t.w - c.w) / (c.w * 0.03)) * exp(-float(i * i + j * j) / 6.0);\n"   /* same surface, nearby */
+    "    vis += t.x * w; ao += t.y * w; ws += w;\n"
+    "  }\n"
+    "  vis /= ws; ao /= ws;\n"
+    "  float shadow = (1.0 - vis) * smoothstep(0.0, 0.3, c.z) * u.sun_k;\n"   /* only where the sun would reach */
+    "  out.write(float4((1.0 - shadow) * mix(1.0, ao, u.ao_k)), gid); }\n";
+
 /* Uniforms, laid out as the shaders' structs (16-byte multiples). */
 typedef struct { float toon[32][4]; float aref, edgew; int highlight, alphatest, wbuf, part, sharpa, pad; } PolyU;
 typedef struct { float rect[4], uv[4]; float flip, p0, p1, p2; } QuadU;
-typedef struct { float edgecol[8][4]; float fogcol[4]; float fogtab[32]; int edge, scale, aa, fog, fog_alpha_only, fogoff, fogshift, wbuf; } PostU;
+typedef struct { float edgecol[8][4]; float fogcol[4]; float fogtab[32]; int edge, scale, aa, fog, fog_alpha_only, fogoff, fogshift, wbuf; int rt, p0, p1, p2; } PostU;
+typedef struct { float sun[4], sun_col[4]; uint32_t frame, has_sun, ratio, pad; float sun_k, ao_k, ao_r, pad2; } RtU;
 typedef struct { int has3d, wide; float wtot, wside; } CompU;
 typedef struct { float keep, p0, p1, p2; } GhostU;
 typedef struct { float scale, focus_keep, bloom, pad; } Hd2dU;
@@ -473,7 +567,7 @@ static int g_scale = 2;
 
 typedef struct {
     __unsafe_unretained id<MTLTexture> color, attr, depth, post; /* owned through fb_keep */
-    __unsafe_unretained id<MTLTexture> wdepth, hd2d;             /* distance from the eye; the HD-2D picture */
+    __unsafe_unretained id<MTLTexture> wdepth, hd2d;             /* view position + distance (ray tracing, depth of field); the HD-2D picture */
     int valid, hd2d_valid;
 } Fb3D;
 static Fb3D g_fb[2];
@@ -492,6 +586,28 @@ static int g_hd2d;
 #define BLOOM_LEVELS 5
 static id<MTLTexture> bloom_tex[BLOOM_LEVELS];                 /* DS resolution, then halves */
 static id<MTLTexture> focus_tex[2]; static int focus_cur;      /* the focus distance, eased over frames */
+
+/* Ray-traced shadows and occlusion (Graphics menu), where the GPU traces rays. */
+static int g_rt, rt_ok;
+static id<MTLComputePipelineState> cp_trace, cp_blur;
+static id<MTLTexture> rt_raw, rt_shade;                        /* about 1.5x the DS's resolution, see make_fbs */
+static int rt_ratio = 1;                                       /* 3D pixels per ray-traced pixel */
+static float* rt_tris; static size_t rt_cap;
+static float* rt_cutv; static size_t rt_cutv_cap;               /* cut-out triangles' positions... */
+typedef struct { float s[3], t[3]; uint32_t off, w, h, wrap; } RtCut;   /* ...and their texels (the kernel's Cut) */
+static RtCut* rt_cuts; static size_t rt_cuts_cap;
+static uint8_t* rt_bits; static size_t rt_bits_n, rt_bits_cap;  /* this frame's masks */
+static const uint8_t* rt_bits_src[256]; static uint32_t rt_bits_at[256]; static int rt_bits_k;
+/* a cut-out texture's mask in this frame's buffer (once a frame each) */
+static int rt_mask(const uint8_t* m, int w, int h) {
+    for (int i = 0; i < rt_bits_k; i++) if (rt_bits_src[i] == m) return (int)rt_bits_at[i];
+    size_t n = ((size_t)w * h + 7) / 8;
+    if (rt_bits_n + n > rt_bits_cap) { rt_bits_cap = (rt_bits_n + n) * 2; rt_bits = realloc(rt_bits, rt_bits_cap); }
+    memcpy(rt_bits + rt_bits_n, m, n);
+    int at = (int)rt_bits_n; rt_bits_n += n;
+    if (rt_bits_k < 256) { rt_bits_src[rt_bits_k] = m; rt_bits_at[rt_bits_k++] = (uint32_t)at; }
+    return at;
+}
 
 const int* g_gl_scale = &g_scale;
 
@@ -513,14 +629,14 @@ static void flush(int wait) {
 }
 
 /* ---------------------------------------------------------------- textures */
-typedef struct { uint32_t ti, pl; uint64_t hash; void* tex; int w, h; uint64_t checked, used; int live; } TexEntry;   /* tex: retained */
+typedef struct { uint32_t ti, pl; uint64_t hash; void* tex; int w, h; uint64_t checked, used; int live, holes; uint8_t* mask; } TexEntry;   /* tex: retained; holes: see-through texels, mask: 1 bit a texel, solid */
 #define TEXCACHE 4096
 static TexEntry g_texcache[TEXCACHE];
 static int g_smooth;                                           /* smooth textures (bilinear filtering) */
 static uint64_t g_frameno;
 static uint8_t* g_decode;
 
-static void tex_release(TexEntry* e) { if (e->tex) CFRelease(e->tex); e->tex = NULL; }
+static void tex_release(TexEntry* e) { if (e->tex) CFRelease(e->tex); e->tex = NULL; free(e->mask); e->mask = NULL; }
 
 static TexEntry* tex_lookup(uint32_t ti, uint32_t pl) {
     uint32_t key = (ti & 0x3FF0FFFFu);                        /* without repeat/flip/transform bits */
@@ -588,7 +704,7 @@ static id<MTLTexture> upload(MTLPixelFormat fmt, int w, int h, const void* px, i
     return t;
 }
 
-static id<MTLTexture> texture_for(uint32_t ti, uint32_t pl, int* w, int* h) {
+static id<MTLTexture> texture_for(uint32_t ti, uint32_t pl, int* w, int* h, int* holes, const uint8_t** mask) {
     TexEntry* e = tex_lookup(ti, pl);
     gpu3d_tex_size(ti, w, h);
     e->used = g_frameno;
@@ -599,12 +715,18 @@ static id<MTLTexture> texture_for(uint32_t ti, uint32_t pl, int* w, int* h) {
             double t0 = perf_ms();
             e->hash = hs; e->w = *w; e->h = *h;
             gpu3d_decode_texture(ti, pl, g_decode);
+            e->holes = 0;                                       /* ray tracing: which texels cast a shadow */
+            for (size_t i = 0; i < (size_t)*w * *h && !e->holes; i++) e->holes = g_decode[i * 4 + 3] == 0;
+            free(e->mask); e->mask = NULL;
+            if (e->holes && (e->mask = calloc(((size_t)*w * *h + 7) / 8, 1)))
+                for (size_t i = 0; i < (size_t)*w * *h; i++) if (g_decode[i * 4 + 3]) e->mask[i >> 3] |= (uint8_t)(1 << (i & 7));
             if (g_smooth) bleed(g_decode, *w, *h);
-            tex_release(e);
+            if (e->tex) CFRelease(e->tex);
             e->tex = (void*)CFBridgingRetain(upload(MTLPixelFormatRGBA8Unorm, *w, *h, g_decode, 4));
             g_gl_stats.uploads++; g_gl_stats.upload_texels += *w * *h; g_gl_stats.upload_ms += perf_ms() - t0;
         }
     }
+    *holes = e->holes; *mask = e->mask;
     return (__bridge id<MTLTexture>)e->tex;
 }
 
@@ -619,7 +741,7 @@ static void make_fbs(void) {
         id<MTLTexture> a = new_tex(MTLPixelFormatRGBA8Unorm, g_fb3_w, g_fb_h, 1, 0);
         id<MTLTexture> d = new_tex(MTLPixelFormatDepth32Float_Stencil8, g_fb3_w, g_fb_h, 1, 0);   /* stencil: the DS's per-pixel flags */
         id<MTLTexture> p = new_tex(MTLPixelFormatRGBA8Unorm, g_fb3_w, g_fb_h, 1, 0);
-        id<MTLTexture> wd = new_tex(MTLPixelFormatR32Float, g_fb3_w, g_fb_h, 1, 0);
+        id<MTLTexture> wd = new_tex(MTLPixelFormatRGBA32Float, g_fb3_w, g_fb_h, 1, 0);   /* view position, distance */
         id<MTLTexture> hd = new_tex(MTLPixelFormatRGBA8Unorm, g_fb3_w, g_fb_h, 1, 0);
         [fb_keep addObjectsFromArray:@[c, a, d, p, wd, hd]];
         f->color = c; f->attr = a; f->depth = d; f->post = p; f->wdepth = wd; f->hd2d = hd;
@@ -627,6 +749,15 @@ static void make_fbs(void) {
     }
     for (int i = 0; i < BLOOM_LEVELS; i++)
         bloom_tex[i] = new_tex(MTLPixelFormatRGBA16Float, (256 + 2 * g_wside) >> i, 192 >> i, 1, 0);
+    rt_ratio = (g_scale * 2 + 2) / 3;                          /* rays for about 1.3-1.5x the DS's pixels (they are blurred anyway) */
+    if (rt_ok) {
+        int w = (g_fb3_w + rt_ratio - 1) / rt_ratio, h = (g_fb_h + rt_ratio - 1) / rt_ratio;
+        MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:(NSUInteger)w height:(NSUInteger)h mipmapped:NO];
+        d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite; d.storageMode = MTLStorageModePrivate;
+        rt_raw = [dev newTextureWithDescriptor:d];
+        d.pixelFormat = MTLPixelFormatR16Float;
+        rt_shade = [dev newTextureWithDescriptor:d];
+    }
     final_tex = new_tex(MTLPixelFormatRGBA8Unorm, g_fb3_w, g_fb_h * 2, 1, 1);
     g_fb_latest = g_fb_shown = -1;
 }
@@ -682,8 +813,8 @@ static id<MTLRenderPipelineState> poly_pipeline(id<MTLLibrary> lib, NSString* fs
     d.fragmentFunction = [lib newFunctionWithName:fs == nil ? @"fs_poly" : fs];
     d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
     d.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA8Unorm;
-    d.colorAttachments[2].pixelFormat = MTLPixelFormatR32Float;
-    d.colorAttachments[2].writeMask = mask1 == 1 ? MTLColorWriteMaskRed : MTLColorWriteMaskNone;   /* the distance: with the pixel's attributes */
+    d.colorAttachments[2].pixelFormat = MTLPixelFormatRGBA32Float;
+    d.colorAttachments[2].writeMask = mask1 == 1 ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;   /* the position: with the pixel's attributes */
     d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
     d.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
     d.colorAttachments[0].writeMask = mask0 ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
@@ -735,6 +866,15 @@ int gl_render_init(int scale) {
     pl_up = pipeline_add(lib, @"vs_quad", @"fs_up", MTLPixelFormatRGBA16Float, 1);
     pl_hd2d = pipeline(lib, @"vs_quad", @"fs_hd2d", MTLPixelFormatRGBA8Unorm);
     for (int i = 0; i < 2; i++) focus_tex[i] = new_tex(MTLPixelFormatR32Float, 1, 1, 1, 0);
+    if (dev.supportsRaytracing && !getenv("DQIX_NO_RT")) {
+        id<MTLLibrary> rl = [dev newLibraryWithSource:@(MSL_RT) options:opt error:&err];
+        if (rl) {
+            cp_trace = [dev newComputePipelineStateWithFunction:[rl newFunctionWithName:@"rt_trace"] error:&err];
+            cp_blur = [dev newComputePipelineStateWithFunction:[rl newFunctionWithName:@"rt_blur"] error:&err];
+        }
+        rt_ok = cp_trace && cp_blur;
+        if (!rt_ok) fprintf(stderr, "Metal: no ray tracing (%s)\n", err ? err.localizedDescription.UTF8String : "?");
+    }
     ds_cache = [NSMutableDictionary dictionary];
     ds_none = [dev newDepthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]];
     make_samplers();
@@ -744,7 +884,7 @@ int gl_render_init(int scale) {
     static const uint8_t white[4] = { 255, 255, 255, 255 };
     white_tex = upload(MTLPixelFormatRGBA8Unorm, 1, 1, white, 4);
     g_decode = malloc(1024 * 1024 * 4);
-    make_fbs();
+    make_fbs();                                                /* after the ray tracing's setup: its buffers too */
     g_ready = 1;
     snprintf(g_gl_name, sizeof g_gl_name, "%s / Metal", dev.name.UTF8String);
     fprintf(stderr, "Metal renderer: %s, 3D at %dx\n", g_gl_name, g_scale);
@@ -794,6 +934,7 @@ static void push_vertex(int* nv, const SVtx* v, float alpha, const Poly* p, floa
     o[12] = (float)((p->attr >> 24) & 63) / 63.0f; o[13] = (float)((p->attr >> 15) & 1);
     o[14] = corner == 0; o[15] = corner == 1; o[16] = corner == 2;
     o[17] = (float)ext;
+    o[18] = v->vx; o[19] = v->vy; o[20] = v->vz;
     (*nv)++;
 }
 
@@ -801,7 +942,7 @@ static void push_vertex(int* nv, const SVtx* v, float alpha, const Poly* p, floa
 #define ST_TRANS 0x40                    /* a translucent polygon is on it (its id: bits 0-4, of the DS's 0-5) */
 #define ST_MASKBIT 0x20                  /* marked by the latest shadow mask */
 #define ST_ID 0x1F
-typedef struct { int first, count; __unsafe_unretained id<MTLTexture> tex; int sampler; float tw, th; int translucent, depth_write, depth_eq, lines, pid, shadow, fog, alpha1; } Batch;
+typedef struct { int first, count; __unsafe_unretained id<MTLTexture> tex; int sampler; float tw, th; int translucent, depth_write, depth_eq, lines, pid, shadow, fog, alpha1, holes, mask_off; } Batch;
 static Batch* g_batches; static int g_bcap;
 
 /* The GL state gl_render.c sets, kept as it is and turned into Metal objects at each draw. */
@@ -900,7 +1041,97 @@ static void hd2d_passes(Fb3D* fb) {
 }
 
 void gl_set_hd2d(int on) { g_hd2d = on != 0; }
-int gl_effects(void) { return GL_EFFECT_HD2D; }
+void gl_set_rt(int on) { g_rt = on != 0; }
+int gl_effects(void) { return GL_EFFECT_HD2D | (rt_ok ? GL_EFFECT_RT : 0); }
+
+/* Ray tracing on this frame's solid triangles (view space): shadows from the
+ * sun, occlusion; the shade factor goes to rt_shade. 0 if nothing to trace. */
+static int rt_passes(Fb3D* fb, const Frame3D* f, int nb) {
+    size_t n = 0, nc = 0, ncut = 0;
+    for (int i = 0; i < nb; i++) {
+        const Batch* b = &g_batches[i];
+        if (b->translucent || b->lines || b->shadow) continue;
+        if (b->holes && b->mask_off < 0) continue;              /* no mask: it would cast boxes */
+        for (int k = 0; k + 2 < b->count; k += 3) {
+            const float* v = g_verts + (size_t)(b->first + k) * VTX_FLOATS;
+            if (!b->holes) {
+                if (n + 9 > rt_cap) { rt_cap = (n + 9) * 2; rt_tris = realloc(rt_tris, rt_cap * sizeof(float)); }
+                for (int j = 0; j < 3; j++) memcpy(rt_tris + n + j * 3, v + j * VTX_FLOATS + 18, 3 * sizeof(float));
+                n += 9;
+                continue;
+            }
+            if (nc + 9 > rt_cutv_cap) { rt_cutv_cap = (nc + 9) * 2; rt_cutv = realloc(rt_cutv, rt_cutv_cap * sizeof(float)); }
+            if (ncut + 1 > rt_cuts_cap) { rt_cuts_cap = (ncut + 1) * 2; rt_cuts = realloc(rt_cuts, rt_cuts_cap * sizeof(RtCut)); }
+            RtCut* c = &rt_cuts[ncut++];
+            for (int j = 0; j < 3; j++) {
+                memcpy(rt_cutv + nc + j * 3, v + j * VTX_FLOATS + 18, 3 * sizeof(float));
+                c->s[j] = v[j * VTX_FLOATS + 8]; c->t[j] = v[j * VTX_FLOATS + 9];
+            }
+            nc += 9;
+            c->off = (uint32_t)b->mask_off; c->w = (uint32_t)b->tw; c->h = (uint32_t)b->th; c->wrap = (uint32_t)b->sampler;
+        }
+    }
+    size_t ntri = n / 9;
+    {   static int lg = -1; if (lg < 0) lg = getenv("DQIX_RT_LOG") != NULL;   /* tests: what the rays see */
+        if (lg && g_frame % 300 == 0)
+            fprintf(stderr, "rt: frame %llu solid %zu cut-out %zu (masks %zu bytes)\n", (unsigned long long)g_frame, ntri, ncut, rt_bits_n);
+    }
+    if (!ntri && !ncut) return 0;
+    NSMutableArray* geo = [NSMutableArray array];
+    id<MTLBuffer> cuts = nil, bits = nil;
+    if (ntri) {
+        MTLAccelerationStructureTriangleGeometryDescriptor* g = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+        g.vertexBuffer = [dev newBufferWithBytes:rt_tris length:n * sizeof(float) options:MTLResourceStorageModeShared];
+        g.vertexStride = 3 * sizeof(float); g.triangleCount = ntri; g.opaque = YES;
+        [geo addObject:g];
+    }
+    if (ncut) {                                                /* the kernel looks at these texel by texel */
+        MTLAccelerationStructureTriangleGeometryDescriptor* g = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+        g.vertexBuffer = [dev newBufferWithBytes:rt_cutv length:nc * sizeof(float) options:MTLResourceStorageModeShared];
+        g.vertexStride = 3 * sizeof(float); g.triangleCount = ncut; g.opaque = NO;
+        [geo addObject:g];
+        cuts = [dev newBufferWithBytes:rt_cuts length:ncut * sizeof(RtCut) options:MTLResourceStorageModeShared];
+        bits = [dev newBufferWithBytes:rt_bits length:rt_bits_n ? rt_bits_n : 1 options:MTLResourceStorageModeShared];
+    } else {
+        cuts = [dev newBufferWithLength:sizeof(RtCut) options:MTLResourceStorageModeShared];
+        bits = [dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
+    }
+    MTLPrimitiveAccelerationStructureDescriptor* ad = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+    ad.geometryDescriptors = geo;
+    ad.usage = MTLAccelerationStructureUsagePreferFastBuild;
+    MTLAccelerationStructureSizes sz = [dev accelerationStructureSizesWithDescriptor:ad];
+    id<MTLAccelerationStructure> as = [dev newAccelerationStructureWithSize:sz.accelerationStructureSize];
+    id<MTLBuffer> scratch = [dev newBufferWithLength:sz.buildScratchBufferSize ? sz.buildScratchBufferSize : 16 options:MTLResourceStorageModePrivate];
+    if (!as || !scratch) return 0;
+    id<MTLAccelerationStructureCommandEncoder> ae = [cur_cb() accelerationStructureCommandEncoder];
+    [ae buildAccelerationStructure:as descriptor:ad scratchBuffer:scratch scratchBufferOffset:0];
+    [ae endEncoding];
+    /* The game's own light if it lights its models with the DS's lights; DQIX
+     * doesn't (vertex colours, toon shading), so then a sun of our own: above,
+     * a little to the left and behind the camera, so shadows fall away from the
+     * viewer and the same way on screen as the camera turns. */
+    float sun[3] = { -0.35f, 0.85f, 0.40f }, sl = 0;
+    if (f->has_sun) memcpy(sun, f->sun, sizeof sun);
+    for (int c = 0; c < 3; c++) sl += sun[c] * sun[c];
+    sl = 1.0f / sqrtf(sl);
+    RtU u = { { sun[0] * sl, sun[1] * sl, sun[2] * sl, 0 }, { 1, 1, 1, 0 },
+              (uint32_t)g_frameno, 1, (uint32_t)rt_ratio, 0, 0.55f, 0.6f, 0.08f, 0 };
+    id<MTLComputeCommandEncoder> ce = [cur_cb() computeCommandEncoder];
+    [ce setComputePipelineState:cp_trace];
+    [ce setBytes:&u length:sizeof u atIndex:0];
+    [ce setAccelerationStructure:as atBufferIndex:1];
+    [ce setBuffer:cuts offset:0 atIndex:2];
+    [ce setBuffer:bits offset:0 atIndex:3];
+    [ce setTexture:fb->wdepth atIndex:0];
+    [ce setTexture:rt_raw atIndex:2];
+    [ce dispatchThreads:MTLSizeMake(rt_raw.width, rt_raw.height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [ce setComputePipelineState:cp_blur];
+    [ce setTexture:rt_raw atIndex:0];
+    [ce setTexture:rt_shade atIndex:1];
+    [ce dispatchThreads:MTLSizeMake(rt_raw.width, rt_raw.height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [ce endEncoding];
+    return 1;
+}
 
 static void gl_vblank(void) {
     g_fb_shown = g_fb_latest;                                  /* what was rendered last is visible now */
@@ -915,6 +1146,8 @@ static void gl_render(const Frame3D* f) {
 }
 static void gl_render_(const Frame3D* f) {
     g_frameno++;
+    {   static int lg = -1; if (lg < 0) lg = getenv("DQIX_RT_LOG") != NULL;   /* tests: timed frames start with the GPU idle */
+        if (lg && g_frame % 300 == 0) { id<MTLCommandBuffer> c = [queue commandBuffer]; [c commit]; [c waitUntilCompleted]; } }
     {   /* tests: DQIX_GL_PROBE="f,x,y": on the first 3D frame from frame f, list the polygons over DS pixel x,y */
         static int pn = -2, px, py; const char* e;
         if (pn == -2) { pn = -1; if ((e = getenv("DQIX_GL_PROBE"))) sscanf(e, "%d,%d,%d", &pn, &px, &py); }
@@ -940,6 +1173,7 @@ static void gl_render_(const Frame3D* f) {
     /* vertices + batches */
     int nv = 0, nb = 0;
     NSMutableArray* used = [NSMutableArray array];             /* this frame's textures, even if the cache drops one meanwhile */
+    rt_bits_n = 0; rt_bits_k = 0;
     for (int i = 0; i < f->n; i++) {
         const Poly* p = f->order[i];
         int fmt = (p->teximg >> 26) & 7;
@@ -951,7 +1185,9 @@ static void gl_render_(const Frame3D* f) {
         b.tex = white_tex; b.tw = 1; b.th = 1;
         if (textured) {
             int w, h;
-            b.tex = texture_for(p->teximg, p->pltt, &w, &h);
+            const uint8_t* mask;
+            b.tex = texture_for(p->teximg, p->pltt, &w, &h, &b.holes, &mask);
+            b.mask_off = b.holes && mask && g_rt && rt_ok ? rt_mask(mask, w, h) : -1;
             if (nb == 0 || g_batches[nb - 1].tex != b.tex) [used addObject:b.tex];
             b.tw = (float)w; b.th = (float)h;
             int sm = (p->teximg >> 16) & 1 ? ((p->teximg >> 18) & 1 ? 2 : 1) : 0;
@@ -1009,10 +1245,11 @@ static void gl_render_(const Frame3D* f) {
     rp.colorAttachments[1].loadAction = MTLLoadActionClear;
     rp.colorAttachments[1].clearColor = MTLClearColorMake(((clear >> 24) & 63) / 63.0, (clear >> 15) & 1, 0, 0);
     rp.colorAttachments[1].storeAction = MTLStoreActionStore;
+    int rt = g_rt && rt_ok;
     rp.colorAttachments[2].texture = fb->wdepth;
     rp.colorAttachments[2].loadAction = MTLLoadActionClear;
-    rp.colorAttachments[2].clearColor = MTLClearColorMake(1e9, 0, 0, 0);   /* nothing drawn: far away */
-    rp.colorAttachments[2].storeAction = g_hd2d ? MTLStoreActionStore : MTLStoreActionDontCare;
+    rp.colorAttachments[2].clearColor = MTLClearColorMake(0, 0, 0, 1e9);   /* nothing drawn: far away */
+    rp.colorAttachments[2].storeAction = g_hd2d || rt ? MTLStoreActionStore : MTLStoreActionDontCare;
     rp.depthAttachment.texture = fb->depth;
     rp.depthAttachment.loadAction = MTLLoadActionClear;
     rp.depthAttachment.clearDepth = cd;
@@ -1122,6 +1359,7 @@ static void gl_render_(const Frame3D* f) {
         u.part = 0;
     }
     [enc endEncoding];
+    if (rt) rt = rt_passes(fb, f, nb);
 
     /* edge marking + fog -> post */
     rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -1149,6 +1387,10 @@ static void gl_render_(const Frame3D* f) {
     pu.fogoff = IO16_(0x35C) & 0x7FFF;
     pu.fogshift = (disp3d >> 8) & 15;
     pu.wbuf = f->wbuf;
+    { static int dbg = -1; if (dbg < 0) dbg = getenv("DQIX_RT_DEBUG") != NULL;   /* tests: the shade alone */
+      pu.rt = rt ? 1 + dbg : 0; }
+    [enc setFragmentTexture:rt ? rt_shade : white_tex atIndex:3];
+    [enc setFragmentSamplerState:smp_linear atIndex:0];
     [enc setFragmentBytes:&pu length:sizeof pu atIndex:0];
     QuadU q = { { -1, -1, 2, 2 }, { 0, 0, 1, 1 }, -1, 0, 0, 0 };
     [enc setVertexBytes:&q length:sizeof q atIndex:0];
@@ -1156,6 +1398,12 @@ static void gl_render_(const Frame3D* f) {
     [enc endEncoding];
     fb->hd2d_valid = 0;
     if (g_hd2d) { hd2d_passes(fb); fb->hd2d_valid = 1; }
+    {   static int lg = -1; if (lg < 0) lg = getenv("DQIX_RT_LOG") != NULL;   /* tests: the GPU's time for this 3D frame */
+        if (lg && g_frame % 300 == 0) {
+            unsigned long long fr = (unsigned long long)g_frame;
+            [cur_cb() addCompletedHandler:^(id<MTLCommandBuffer> c) { fprintf(stderr, "gpu: frame %llu 3D %.2f ms\n", fr, (c.GPUEndTime - c.GPUStartTime) * 1000.0); }];   /* (the GPU was idle at its start) */
+        }
+    }
     flush(0);                                                   /* the GPU starts on it now */
     fb->valid = 1;
     g_fb_latest = target;

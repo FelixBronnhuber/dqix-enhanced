@@ -19,7 +19,7 @@ enum {
     MI_WIDE_DYN = 240, MI_SINGLE, MI_RESET, MI_VOLUME, MI_MUTE, MI_CONTROLS_EDIT,
     MI_CORNER0 = 250,                                                   /* + 0..3: top left, top right, bottom right, bottom left */
     MI_SSIZE0 = 254,                                                    /* + 0..2: small, medium, large */
-    MI_HD2D = 260,
+    MI_HD2D = 260, MI_RT,
     MI_SEND_REPORT = 210,
 };
 

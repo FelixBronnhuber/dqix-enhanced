@@ -9,6 +9,7 @@ typedef struct {             /* screen-space vertex */
     float zn;                /* z/w mapped to 0..1 */
     float iw;                /* 1/w */
     float r, g, b, s, t;     /* color 0..31, texel coordinates */
+    float vx, vy, vz;        /* view-space position (GPU renderer's lighting; the game never sees it) */
 } SVtx;
 
 #define MAX_POLY 2048
@@ -28,6 +29,8 @@ typedef struct {
     int n, n_opaque;
     int wbuf;                /* depth from w instead of z */
     int width;               /* DS pixels across: 256, or more for widescreen (x of the vertices: 0..width) */
+    int has_sun;             /* the light most of the frame's lit polygons use: */
+    float sun[3], sun_col[3];/* toward it (view space, unit length), its colour 0..1 */
 } Frame3D;
 
 /* A renderer that replaces the software rasterizer (set by the frontend). */
