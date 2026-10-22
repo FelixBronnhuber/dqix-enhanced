@@ -1313,3 +1313,42 @@ int gl_read_3d(uint8_t* out, int* w, int* h) {
 /* Widescreen: which screen was composed wide last (0 top, 1 bottom, -1
  * none) and the DS pixels added each side. */
 int gl_wide_shown(int* side) { *side = g_wside; return g_wide_shown; }
+
+/* ---------------------------------------------------------------- windows */
+/* One context for every window: the first window's. */
+static SDL_GLContext g_ctx;
+static SDL_Window* g_ctx_win;
+
+uint32_t gfx_window_flags(void) {
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    return SDL_WINDOW_OPENGL;
+}
+
+int gfx_attach(SDL_Window* win) {
+    if (!g_ctx) {
+        g_ctx = SDL_GL_CreateContext(win);
+        if (!g_ctx) { fprintf(stderr, "OpenGL 3.3 not available (%s): using the software renderer\n", SDL_GetError()); return 0; }
+        g_ctx_win = win;
+        SDL_GL_SetSwapInterval(0);                               /* pacing follows the audio clock */
+        return 1;
+    }
+    if (SDL_GL_MakeCurrent(win, g_ctx) == 0) SDL_GL_SetSwapInterval(0);
+    SDL_GL_MakeCurrent(g_ctx_win, g_ctx);
+    return 1;
+}
+
+void gfx_detach(SDL_Window* win) {
+    if (!g_ctx) return;
+    if (win == g_ctx_win) { SDL_GL_DeleteContext(g_ctx); g_ctx = NULL; g_ctx_win = NULL; g_ready = 0; return; }
+    SDL_GL_MakeCurrent(g_ctx_win, g_ctx);
+}
+
+void gfx_drawable_size(SDL_Window* win, int* w, int* h) { SDL_GL_GetDrawableSize(win, w, h); }
+void gfx_begin(SDL_Window* win) { if (g_ctx) SDL_GL_MakeCurrent(win, g_ctx); }
+void gfx_swap(SDL_Window* win) {
+    SDL_GL_SwapWindow(win);
+    if (win != g_ctx_win && g_ctx) SDL_GL_MakeCurrent(g_ctx_win, g_ctx);
+}

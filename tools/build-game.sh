@@ -1,6 +1,8 @@
 #!/bin/sh
 # Turn a Dragon Quest IX ROM into the PC game. Run by BUILD.bat inside MSYS2
-# (UCRT64); also works on Linux with gcc, make, python3 (+ PyYAML) and SDL2.
+# (UCRT64); also works on Linux with gcc, make, python3 (+ PyYAML) and SDL2,
+# and on macOS with the Command Line Tools, python3 (+ PyYAML) and SDL2
+# (brew install sdl2; pip3 install pyyaml).
 #
 #   tools/build-game.sh <rom.nds>
 #
@@ -28,6 +30,7 @@ YDQP) echo "   Dragon Quest IX (Europe): only the USA version is tested; trying 
 esac
 
 PY=python3; command -v $PY >/dev/null 2>&1 || PY=python
+$PY -c "import yaml" 2>/dev/null || { echo "   Python's yaml module is missing: pip3 install pyyaml"; exit 1; }
 echo "== Extracting the game's code"
 $PY tools/extract_rom.py "$ROM" build/extract
 echo "== Recompiling it to C (about a minute)"
@@ -79,6 +82,12 @@ MINGW*|MSYS*)
          CFLAGS="-O1 -w" DEFS=-DRECOMP_TRACE SDL_CFLAGS="$(sdl2-config --cflags)" SDL_LIBS="-lSDL2" \
          LDFLAGS="-static-libgcc -Wl,--stack,67108864" RES="$RES" "$EXE" core
     cp /ucrt64/bin/SDL2.dll game/ ;;
+Darwin)
+    # the 3D through Metal, a Cocoa menu bar; the ARM9 runs on the main stack: 64 MB like Windows
+    EXE=game/dqix
+    make -j"$(sysctl -n hw.ncpu)" -f build.mk OS=Darwin CC=clang GEN=build/recomp GEN7=build/recomp7 OBJ=build/obj FRONTEND=sdl OUT="$EXE" CORE=game/dqixcore.dylib PIC=-fPIC \
+         CFLAGS="-O1 -w" DEFS=-DRECOMP_TRACE SDL_CFLAGS="${SDL_CFLAGS:-$(sdl2-config --cflags)}" SDL_LIBS="${SDL_LIBS:-$(sdl2-config --libs)}" \
+         LDFLAGS="-Wl,-stack_size,0x4000000" "$EXE" core ;;
 *)
     EXE=game/dqix
     make -j"$(nproc)" -f build.mk GEN=build/recomp GEN7=build/recomp7 OBJ=build/obj FRONTEND=sdl OUT="$EXE" CORE=game/dqixcore.so PIC=-fPIC \

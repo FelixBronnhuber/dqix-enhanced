@@ -76,8 +76,7 @@ static int g_fast;
 static uint32_t g_fps_frames; static uint64_t g_fps_t0;
 static int g_headless;          /* DQIX_NOWINDOW: run without a window (still uses SDL audio off) */
 static int g_hidden;            /* another player's console in a session: no window, no sound, no pacing */
-static int g_gl;                /* OpenGL renderer active (else SDL_Renderer + software 3D) */
-static SDL_GLContext g_glctx;
+static int g_gl;                /* GPU renderer active: OpenGL, or Metal on macOS (else SDL_Renderer + software 3D) */
 static int g_scale3d = 2;
 extern void (*g_report_capture)(uint32_t out[2][256 * 192]);
 extern void (*g_report_perf)(FILE* f);
@@ -592,26 +591,21 @@ static void layout_window_keep(int keep) {
 }
 static void layout_window(void) { layout_window_keep(0); }
 
-/* OpenGL: a 3.3 core context; on any failure fall back to SDL_Renderer + software 3D. */
+/* The GPU renderer: an OpenGL 3.3 core context (Metal on macOS); on any
+ * failure fall back to SDL_Renderer + software 3D. */
 static int try_gl(void) {
     if (getenv("DQIX_SOFTWARE")) return 0;
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     g_win = SDL_CreateWindow("Dragon Quest IX", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 256 * g_scale, 384 * g_scale,
-                             SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+                             gfx_window_flags() | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (!g_win) return 0;
-    g_glctx = SDL_GL_CreateContext(g_win);
-    if (!g_glctx) { fprintf(stderr, "OpenGL 3.3 not available (%s): using the software renderer\n", SDL_GetError()); SDL_DestroyWindow(g_win); g_win = NULL; return 0; }
-    SDL_GL_SetSwapInterval(0);                                   /* pacing follows the audio clock */
+    if (!gfx_attach(g_win)) { SDL_DestroyWindow(g_win); g_win = NULL; return 0; }
     const char* e = getenv("DQIX_SCALE3D");
     if (e) { g_scale3d = atoi(e); g_res_auto = 0; }
     if (getenv("DQIX_SMOOTH")) g_smooth = atoi(getenv("DQIX_SMOOTH")) != 0;   /* tests */
     gl_set_smooth(g_smooth);
     if (!gl_render_init(g_res_auto ? (getenv("DQIX_AUTO_FROM") ? 2 : 4) : g_scale3d)) {
         fprintf(stderr, "OpenGL renderer failed to start: using the software renderer\n");
-        SDL_GL_DeleteContext(g_glctx); SDL_DestroyWindow(g_win); g_win = NULL; return 0;
+        gfx_detach(g_win); SDL_DestroyWindow(g_win); g_win = NULL; return 0;
     }
     g_gl = 1;
     g_renderer3d_verify = getenv("DQIX_GL_VERIFY") != NULL;
@@ -667,7 +661,7 @@ static void second_window_sync(void) {
     int want = g_gl && ((g_two && !g_single) || (g_wide && g_wide_pop)) && !g_side_by_side && g_win && !g_headless;
     if (!want && g_win2) {
         second_window_keep_rect();
-        SDL_GL_MakeCurrent(g_win, g_glctx);
+        gfx_detach(g_win2);
         SDL_DestroyWindow(g_win2); g_win2 = NULL;
         return;
     }
@@ -689,13 +683,12 @@ static void second_window_sync(void) {
         SDL_Rect r;
         if (SDL_GetDisplayUsableBounds(SDL_GetWindowDisplayIndex(g_win), &r) == 0 && mx + mw + 16 + w <= r.x + r.w) { x = mx + mw + 16; y = my; }
     }
-    g_win2 = SDL_CreateWindow("Dragon Quest IX", x, y, w, h, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+    g_win2 = SDL_CreateWindow("Dragon Quest IX", x, y, w, h, gfx_window_flags() | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (!g_win2) { fprintf(stderr, "second window: %s\n", SDL_GetError()); return; }
     window_icon_for(g_win2);
     menu_init_second(g_win2);                                    /* its own bar: Fullscreen */
     second_window_title();
-    if (SDL_GL_MakeCurrent(g_win2, g_glctx) == 0) SDL_GL_SetSwapInterval(0);
-    SDL_GL_MakeCurrent(g_win, g_glctx);
+    if (!gfx_attach(g_win2)) { SDL_DestroyWindow(g_win2); g_win2 = NULL; return; }
     if (g_win2_full) { menu_show_second(0); SDL_SetWindowFullscreen(g_win2, SDL_WINDOW_FULLSCREEN_DESKTOP); }
     SDL_RaiseWindow(g_win);                                      /* the keyboard stays with the game's window */
 }
@@ -1033,7 +1026,7 @@ static void auto_scale(void) {
     SDL_Window* ws[2] = { g_win, g_win2 };
     for (int k = 0; k < 2; k++) {
         if (!ws[k]) continue;
-        int w, h; SDL_GL_GetDrawableSize(ws[k], &w, &h);
+        int w, h; gfx_drawable_size(ws[k], &w, &h);
         GlPresent v; canvas_layout_for(&v, w, h, k);
         for (int i = 0; i < 2; i++) {
             const float* r = i ? v.bot : v.top, *x = i ? v.botx : v.topx;
@@ -1078,18 +1071,19 @@ static void present_gl(void) {
         g_small_alpha += (target - g_small_alpha) * 0.2f;
         if (fabsf(target - g_small_alpha) < 0.01f) g_small_alpha = target;
     }
-    int w, h; SDL_GL_GetDrawableSize(g_win, &w, &h);
+    int w, h; gfx_drawable_size(g_win, &w, &h);
     GlPresent v; canvas_layout(&v, w, h);
+    gfx_begin(g_win);
     gl_present(&v);
     window_shot_hook(w, h, 0);
-    SDL_GL_SwapWindow(g_win);
-    if (g_win2 && SDL_GL_MakeCurrent(g_win2, g_glctx) == 0) {   /* two windows: the other screen */
-        int w2, h2; SDL_GL_GetDrawableSize(g_win2, &w2, &h2);
+    gfx_swap(g_win);
+    if (g_win2) {                                                /* two windows: the other screen */
+        int w2, h2; gfx_drawable_size(g_win2, &w2, &h2);
         GlPresent v2; canvas_layout_for(&v2, w2, h2, 1); v2.again = 1;
+        gfx_begin(g_win2);
         gl_present(&v2);
         window_shot_hook(w2, h2, 1);
-        SDL_GL_SwapWindow(g_win2);
-        SDL_GL_MakeCurrent(g_win, g_glctx);
+        gfx_swap(g_win2);
     }
 }
 
@@ -1295,7 +1289,8 @@ static void restart_with(const char* session) {
     if (session) setenv("DQIX_SESSION", session, 1); else unsetenv("DQIX_SESSION");
     if (g_player_name[0]) setenv("DQIX_PLAYER_NAME", g_player_name, 1);
     extern char** g_argv;
-    execv("/proc/self/exe", g_argv);
+    char exe[1024];
+    if (self_exe(exe, sizeof exe)) execv(exe, g_argv);
 #endif
 }
 

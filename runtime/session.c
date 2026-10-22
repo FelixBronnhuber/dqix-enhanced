@@ -68,6 +68,22 @@ static void sleep_ms(int ms) { struct timespec t = { ms / 1000, (long)(ms % 1000
 static int sock_err_again(void) { return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS; }
 static int sock_errno(void) { return errno; }
 static void make_dir(const char* p) { mkdir(p, 0755); }
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+int self_exe(char* out, size_t n) {
+#ifdef __APPLE__
+    char p[1024]; uint32_t sz = sizeof p;
+    if (_NSGetExecutablePath(p, &sz) != 0 || !realpath(p, out)) return 0;   /* out: at least PATH_MAX */
+    (void)n;
+    return 1;
+#else
+    ssize_t l = readlink("/proc/self/exe", out, n - 1);
+    if (l <= 0) return 0;
+    out[l] = 0;
+    return 1;
+#endif
+}
 #include <dirent.h>
 static int list_dir(const char* dir, int want_dirs, char names[][64], int max) {
     DIR* d = opendir(dir); int n = 0;
@@ -203,8 +219,12 @@ static uint64_t build_id(void) {
     char exe[MAX_PATH]; DWORD l = GetModuleFileNameA(NULL, exe, MAX_PATH); if (l && l < MAX_PATH) h = fnv_file(exe, h);
     if (self_dir(dir, sizeof dir)) { snprintf(path, sizeof path, "%s\\dqixcore.dll", dir); h = fnv_file(path, h); }
 #else
-    h = fnv_file("/proc/self/exe", h);
+    char exe[1024]; if (self_exe(exe, sizeof exe)) h = fnv_file(exe, h);
+#ifdef __APPLE__
+    if (self_dir(dir, sizeof dir)) { snprintf(path, sizeof path, "%s/dqixcore.dylib", dir); h = fnv_file(path, h); }
+#else
     if (self_dir(dir, sizeof dir)) { snprintf(path, sizeof path, "%s/dqixcore.so", dir); h = fnv_file(path, h); }
+#endif
 #endif
     return id = h | 1;
 }
@@ -521,7 +541,7 @@ static void spawn_hidden(int k) {
     if (pid == 0) {
         FILE* f = freopen(log, "w", stderr); (void)f;
         f = freopen(log, "a", stdout); (void)f;
-        char self[1024]; ssize_t l = readlink("/proc/self/exe", self, sizeof self - 1); self[l > 0 ? l : 0] = 0;
+        char self[1024]; if (!self_exe(self, sizeof self)) self[0] = 0;
         char* args[] = { self, g_rom_path, g_extract_path, (char*)"0", (char*)"1", save, NULL };
         execve(self, args, env);
         _exit(127);
@@ -548,7 +568,11 @@ static void* lib_sym(LibHandle h, const char* n) { return (void*)GetProcAddress(
 #include <dlfcn.h>
 #include <ucontext.h>
 typedef void* LibHandle;
+#ifdef __APPLE__
+#define LIB_EXT ".dylib"
+#else
 #define LIB_EXT ".so"
+#endif
 static LibHandle lib_open(const char* p) { return dlopen(p, RTLD_NOW | RTLD_LOCAL); }
 static void* lib_sym(LibHandle h, const char* n) { return dlsym(h, n); }
 #endif
@@ -614,9 +638,7 @@ static int self_dir(char* out, size_t n) {
     char exe[MAX_PATH]; DWORD l = GetModuleFileNameA(NULL, exe, MAX_PATH);
     if (!l || l >= MAX_PATH) return 0;
 #else
-    char exe[1024]; ssize_t l = readlink("/proc/self/exe", exe, sizeof exe - 1);
-    if (l <= 0) return 0;
-    exe[l] = 0;
+    char exe[1024]; if (!self_exe(exe, sizeof exe)) return 0;
 #endif
     char* sl = strrchr(exe, '/');
 #ifdef _WIN32

@@ -1,8 +1,21 @@
-/* OpenGL renderer interface (gl_render.c). The SDL frontend creates the GL
- * context, then calls these. */
+/* GPU renderer interface: OpenGL (gl_render.c), or Metal on macOS
+ * (metal_render.m). The SDL frontend opens its windows through the gfx_*
+ * functions, then calls the others. */
 #pragma once
 #include <stdint.h>
+#include "SDL.h"
 #include "gpu3d.h"
+
+/* The windows: SDL_CreateWindow flags (call before creating one; GL sets its
+ * context attributes here), then gfx_attach() for each window (the first one
+ * creates the context / device; 0 = not available). gfx_begin() picks the
+ * window gl_present() draws into; gfx_swap() shows it. */
+uint32_t gfx_window_flags(void);
+int gfx_attach(SDL_Window* win);
+void gfx_detach(SDL_Window* win);
+void gfx_drawable_size(SDL_Window* win, int* w, int* h);
+void gfx_begin(SDL_Window* win);
+void gfx_swap(SDL_Window* win);
 
 int gl_render_init(int scale);                        /* 0 on failure (use the software path) */
 void gl_render_set_scale(int scale);

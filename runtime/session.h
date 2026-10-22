@@ -22,6 +22,7 @@
  */
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 
 #define SESSION_PORT 27900
 #define SESSION_MAX 4
@@ -64,3 +65,7 @@ void session_cancel(void);
 void session_set_name(const char* name);
 /* the lobby screen etc.: called repeatedly while the lobby waits */
 extern void (*session_lobby_hook)(void);
+
+#ifndef _WIN32
+int self_exe(char* out, size_t n);        /* this program's path (n >= 1024) */
+#endif

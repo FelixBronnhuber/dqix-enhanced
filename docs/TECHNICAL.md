@@ -310,7 +310,7 @@ runtime/ipc.c          IPC sync + FIFOs between the CPUs
 runtime/cpu_bios.c     CPU modes, interrupt entry, CP15, BIOS (both CPUs), logging
 runtime/threads.c      game threads on coroutines (both CPUs) and ARM7 scheduling
 runtime/interp.c       ARM/Thumb interpreter for code that isn't recompiled
-runtime/coro.h         coroutines: ucontext (Linux) / Fibers (Windows)
+runtime/coro.h         coroutines: ucontext (Linux, macOS) / Fibers (Windows)
 runtime/dispatch.c     indirect calls, overlay detection, budgets, call trace
 runtime/main.c         ROM loading, firmware boot state, entry
 runtime/gpu2d.c        both 2D engines, per scanline
@@ -325,7 +325,9 @@ third_party/libslirp   user-mode network stack (BSD licence, as vendored by melo
 runtime/input.c        DS buttons / touch from the frontend or a script
 runtime/frontend_sdl.c window, input, audio, pacing, settings (SDL2)
 runtime/menu_win32.c   the menu bar (Windows)
+runtime/menu_cocoa.m   the menu bar and windows (macOS)
 runtime/gl_render.c    OpenGL: Enhanced 3D, composition, the DS Lite screen + console
+runtime/metal_render.m the same in Metal (macOS), pass for pass
 runtime/frontend_none.c headless frontend (tests)
 runtime/report.c       F10 / crash reports (inputs, saves, screenshot, log)
 patches.txt            instruction overrides applied when recompiling
@@ -340,7 +342,7 @@ recomp.bat             regenerate the ARM9 C on Windows (developer build)
 Install Dragon Quest IX.bat  the setup window (tools/setup-wizard.ps1): ROM version, folder,
                        shortcuts, Apps entry (tools/uninstall.ps1), then BUILD.bat
 BUILD.bat              the one-click build: your ROM -> the game folder
-tools/build-game.sh    what BUILD.bat runs (inside MSYS2; also works on Linux)
+tools/build-game.sh    what BUILD.bat runs (inside MSYS2; also works on Linux and macOS)
 tools/extract_rom.py   takes the code out of a DS ROM (same output as dsd rom extract)
 config/usa/arm9        function names and relocations from the dqix-decomp project
 rom/, extras/          where your ROM and the optional extras go

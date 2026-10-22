@@ -100,6 +100,13 @@ Prefer no window? Put your ROM in the `rom` folder and double-click
 **`BUILD.bat`** instead; the game appears in the `game` folder
 (`game\dqix.exe`).
 
+**On a Mac (Apple Silicon)**: install the Command Line Tools
+(`xcode-select --install`), [Homebrew](https://brew.sh), then
+`brew install sdl2 python` and `pip3 install pyyaml`. Put your ROM in the
+`rom` folder and run `tools/build-game.sh rom/<your rom>.nds` in Terminal.
+Start the game with `game/play.sh`. Enhanced mode draws through Metal, and
+the settings are in the menu bar at the top of the screen.
+
 Your save (`dqix.sav`) and settings (`settings.ini`) live in the `game`
 folder. **Don't share the `game` or `build` folders**: they contain the game.
 
