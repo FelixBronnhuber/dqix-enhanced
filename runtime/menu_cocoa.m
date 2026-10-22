@@ -105,6 +105,8 @@ void menu_init(SDL_Window* win, const char* const* shell_names, int n_shells) {
     sep(res);
     item(res, MI_RES_AUTO, "&Auto: as sharp as your screen (up to 12x)");
     item(gfx, MI_SMOOTH, "&Smooth textures (Enhanced)");
+    sep(gfx);
+    item(gfx, MI_HD2D, "&HD-2D look: depth of field, glow, warm colours (Enhanced)");
 
     NSMenu* scr = top("&Screen");
     item(scr, MI_LCD, "&DS Lite screen\tF6");

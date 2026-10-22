@@ -41,7 +41,7 @@ static const char* MSL =
     "  r.attr = float4(o[10], o[11], o[12], o[13]); r.bary = float3(o[14], o[15], o[16]); r.ext = int(o[17] + 0.5);\n"
     "  return r; }\n"
     "struct PolyU { float4 toon[32]; float aref, edgew; int highlight, alphatest, wbuf, part, sharpa, pad; };\n"
-    "struct PolyOut { float4 color [[color(0)]]; float4 attr [[color(1)]]; float depth [[depth(any)]]; };\n"
+    "struct PolyOut { float4 color [[color(0)]]; float4 attr [[color(1)]]; float w [[color(2)]]; float depth [[depth(any)]]; };\n"
     /* DS pixel pipeline, in 5-bit color steps like the hardware. */
     "fragment PolyOut fs_poly(PolyV in [[stage_in]], constant PolyU& u [[buffer(0)]], texture2d<float> tex [[texture(0)]], sampler smp [[sampler(0)]]) {\n"
     "  float3 gx = dfdx(in.bary), gy = dfdy(in.bary);\n"
@@ -68,6 +68,7 @@ static const char* MSL =
     "  PolyOut o;\n"
     "  o.color = float4(float3(c) / 31.0, fa);\n"
     "  o.attr = float4(in.attr.z, in.attr.w, eflag, 1.0);\n"
+    "  o.w = 1.0 / in.pos.w;\n"                                 /* distance from the eye (HD-2D: depth of field) */
     "  float d = u.wbuf != 0 ? clamp((1.0 / in.pos.w) / 4096.0, 0.0, 1.0) : in.pos.z;\n"
     "  o.depth = rint(d * 16777215.0) / 16777215.0;\n"       /* as a 24-bit depth buffer keeps it */
     "  return o; }\n"
@@ -357,7 +358,91 @@ static const char* MSL =
     "  } else {\n"
     "    outc = float3(0.0);\n"
     "  }\n"
-    "  return float4(outc, 1.0); }\n";
+    "  return float4(outc, 1.0); }\n"
+    "\n"
+    /* ---- HD-2D: depth of field, bloom, colour grade, vignette on the 3D layer.
+     * Textures hold rows as under GL (row 0 = the bottom of the picture). */
+    "struct Hd2dU { float scale, focus_keep, bloom, pad; };\n"
+    /* the focus: the distance at the middle of the picture (where the hero or the
+     * monsters are, in front of the background): the nearer third of 15 samples,
+     * eased over frames */
+    "fragment float fs_focus(QuadV in [[stage_in]], constant Hd2dU& u [[buffer(0)]], texture2d<float> wd [[texture(0)]], texture2d<float> prev [[texture(1)]]) {\n"
+    "  float v[15]; int n = 0;\n"
+    "  float2 sz = float2(wd.get_width(), wd.get_height());\n"
+    "  for (int j = 0; j < 3; j++) for (int i = 0; i < 5; i++) {\n"
+    "    float2 t = float2(0.34 + 0.08 * float(i), 1.0 - (0.45 + 0.12 * float(j)));\n"   /* x across, y from the top */
+    "    float w = wd.read(uint2(t * sz)).r;\n"
+    "    if (w < 1e8) v[n++] = w;\n"
+    "  }\n"
+    "  float old = prev.read(uint2(0)).r;\n"
+    "  if (n == 0) return old;\n"
+    "  for (int a = 1; a < n; a++) for (int b = a; b > 0 && v[b - 1] > v[b]; b--) { float t = v[b]; v[b] = v[b - 1]; v[b - 1] = t; }\n"
+    "  float m = v[n / 3];\n"
+    "  return old <= 0.0 ? m : mix(m, old, u.focus_keep); }\n"
+    /* blur size in DS pixels: grows with the distance from the focus, more behind
+     * it than in front; plus a little toward the top and bottom (tilt-shift) */
+    "float coc(float w, float f, float ytd) {\n"
+    "  if (w >= 1e8) return 3.0;\n"                              /* nothing drawn there (sky): far */
+    "  float d = (w - f) / max(f, 1e-3);\n"
+    "  float c = d > 0.0 ? d * 3.0 : -d * 2.5;\n"
+    "  float tilt = smoothstep(0.42, 0.0, ytd) * 1.2 + smoothstep(0.8, 1.0, ytd) * 0.8;\n"
+    "  return clamp(max(c - 0.15, 0.0) + tilt, 0.0, 2.5); }\n"
+    "fragment float4 fs_dof(QuadV in [[stage_in]], constant Hd2dU& u [[buffer(0)]], texture2d<float> col [[texture(0)]],\n"
+    "                       texture2d<float> wd [[texture(1)]], texture2d<float> foc [[texture(2)]]) {\n"
+    "  int2 p = int2(in.pos.xy); int2 sz = int2(col.get_width(), col.get_height());\n"
+    "  float4 c0 = col.read(uint2(p));\n"
+    "  if (c0.a <= 0.0) return c0;\n"
+    "  float f = foc.read(uint2(0)).r;\n"
+    "  float ytd = 1.0 - (float(p.y) + 0.5) / float(sz.y);\n"
+    "  float r0 = coc(wd.read(uint2(p)).r, f, ytd) * u.scale;\n"   /* in pixels of this texture */
+    "  if (r0 < 0.5) return c0;\n"
+    "  float3 sum = c0.rgb; float ws = 1.0;\n"
+    "  for (int i = 1; i < 24; i++) {\n"                          /* a golden-angle spiral */
+    "    float rr = sqrt(float(i) / 24.0) * r0, a = float(i) * 2.39996;\n"
+    "    int2 q = clamp(p + int2(round(float2(cos(a), sin(a)) * rr)), int2(0), sz - 1);\n"
+    "    float4 c = col.read(uint2(q));\n"
+    "    if (c.a <= 0.0) continue;\n"
+    "    float rq = coc(wd.read(uint2(q)).r, f, 1.0 - (float(q.y) + 0.5) / float(sz.y)) * u.scale;\n"
+    "    float k = clamp(min(rq, r0) - rr + 1.0, 0.0, 1.0);\n"   /* a sharp pixel nearby doesn't spread over this one */
+    "    sum += c.rgb * k; ws += k;\n"
+    "  }\n"
+    "  return float4(sum / ws, c0.a); }\n"
+    /* bloom: the bright parts, down to a few sizes and back up */
+    "fragment float4 fs_bright(QuadV in [[stage_in]], constant Hd2dU& u [[buffer(0)]], texture2d<float> src [[texture(0)]], sampler sm [[sampler(0)]]) {\n"
+    "  float2 dsz = u.scale / float2(src.get_width(), src.get_height());\n"   /* one DS pixel (this texel) in the source */
+    "  float3 acc = float3(0.0);\n"
+    "  for (int j = 0; j < 4; j++) for (int i = 0; i < 4; i++) {\n"
+    "    float4 c = src.sample(sm, in.uv + (float2(i, j) - 1.5) / 4.0 * dsz);\n"
+    "    float l = dot(c.rgb, float3(0.299, 0.587, 0.114));\n"
+    "    acc += c.rgb * smoothstep(0.72, 1.0, l) * step(0.001, c.a);\n"
+    "  }\n"
+    "  return float4(acc / 16.0, 1.0); }\n"
+    "fragment float4 fs_down(QuadV in [[stage_in]], texture2d<float> src [[texture(0)]], sampler sm [[sampler(0)]]) {\n"
+    "  float2 d = 1.0 / float2(src.get_width(), src.get_height());\n"
+    "  float2 uv = in.uv;\n"
+    "  return float4((src.sample(sm, uv + float2(-d.x, -d.y)).rgb + src.sample(sm, uv + float2(d.x, -d.y)).rgb +\n"
+    "                 src.sample(sm, uv + float2(-d.x, d.y)).rgb + src.sample(sm, uv + float2(d.x, d.y)).rgb) * 0.25, 1.0); }\n"
+    "fragment float4 fs_up(QuadV in [[stage_in]], texture2d<float> src [[texture(0)]], sampler sm [[sampler(0)]]) {\n"
+    "  float2 d = 1.0 / float2(src.get_width(), src.get_height());\n"
+    "  float2 uv = in.uv;\n"
+    "  float3 c = src.sample(sm, uv).rgb * 4.0;\n"                 /* a tent: smooth when it grows */
+    "  c += (src.sample(sm, uv + float2(d.x, 0)).rgb + src.sample(sm, uv - float2(d.x, 0)).rgb + src.sample(sm, uv + float2(0, d.y)).rgb + src.sample(sm, uv - float2(0, d.y)).rgb) * 2.0;\n"
+    "  c += src.sample(sm, uv + d).rgb + src.sample(sm, uv - d).rgb + src.sample(sm, uv + float2(d.x, -d.y)).rgb + src.sample(sm, uv - float2(d.x, -d.y)).rgb;\n"
+    "  return float4(c / 16.0, 1.0); }\n"
+    /* the finish: bloom added, a warm grade, a vignette */
+    "fragment float4 fs_hd2d(QuadV in [[stage_in]], constant Hd2dU& u [[buffer(0)]], texture2d<float> col [[texture(0)]],\n"
+    "                        texture2d<float> bloom [[texture(1)]], sampler sm [[sampler(0)]]) {\n"
+    "  float2 sz = float2(col.get_width(), col.get_height());\n"
+    "  float4 c0 = col.read(uint2(in.pos.xy));\n"
+    "  if (c0.a <= 0.0) return c0;\n"
+    "  float2 uv = in.pos.xy / sz;\n"
+    "  float3 c = c0.rgb + bloom.sample(sm, uv).rgb * (u.bloom / 5.0);\n"
+    "  float l = dot(c, float3(0.299, 0.587, 0.114));\n"
+    "  c = mix(float3(l), c, 1.12);\n"                             /* a little more colour */
+    "  c *= mix(float3(0.97, 0.99, 1.04), float3(1.03, 1.0, 0.95), smoothstep(0.2, 0.9, l));\n"   /* cool shadows, warm light */
+    "  float2 v = (uv - 0.5) * float2(1.0, 0.8);\n"
+    "  c *= 1.0 - 0.35 * smoothstep(0.3, 0.75, length(v));\n"
+    "  return float4(clamp(c, 0.0, 1.0), c0.a); }\n";
 
 /* Uniforms, laid out as the shaders' structs (16-byte multiples). */
 typedef struct { float toon[32][4]; float aref, edgew; int highlight, alphatest, wbuf, part, sharpa, pad; } PolyU;
@@ -365,6 +450,7 @@ typedef struct { float rect[4], uv[4]; float flip, p0, p1, p2; } QuadU;
 typedef struct { float edgecol[8][4]; float fogcol[4]; float fogtab[32]; int edge, scale, aa, fog, fog_alpha_only, fogoff, fogshift, wbuf; } PostU;
 typedef struct { int has3d, wide; float wtot, wside; } CompU;
 typedef struct { float keep, p0, p1, p2; } GhostU;
+typedef struct { float scale, focus_keep, bloom, pad; } Hd2dU;
 typedef struct {
     float view[4], win_canvas[4], top[4], bot[4], ctop[4], cbot[4], topx_botx[4], lid[4], base[4], btn[4], hinge[4], skin_texw_alpha[4];
     int f0[4], f1[4]; float f2[4];
@@ -375,6 +461,7 @@ static id<MTLDevice> dev;
 static id<MTLCommandQueue> queue;
 static id<MTLCommandBuffer> cb;                               /* being recorded; committed at swap / read-back */
 static id<MTLRenderPipelineState> pl_post, pl_comp, pl_ghost, pl_screen, pl_stclear;
+static id<MTLRenderPipelineState> pl_focus, pl_dof, pl_bright, pl_down, pl_up, pl_hd2d;   /* the HD-2D look */
 static id<MTLRenderPipelineState> pl_poly[3][2][3];             /* [blend: off, DS, replace][colour 0: none, all][colour 1: none, all, fog flag only] */
 static NSMutableDictionary<NSNumber*, id<MTLDepthStencilState>>* ds_cache;
 static id<MTLDepthStencilState> ds_none;
@@ -386,7 +473,8 @@ static int g_scale = 2;
 
 typedef struct {
     __unsafe_unretained id<MTLTexture> color, attr, depth, post; /* owned through fb_keep */
-    int valid;
+    __unsafe_unretained id<MTLTexture> wdepth, hd2d;             /* distance from the eye; the HD-2D picture */
+    int valid, hd2d_valid;
 } Fb3D;
 static Fb3D g_fb[2];
 static NSMutableArray* fb_keep;
@@ -397,6 +485,13 @@ static int g_wide_shown = -1;                                  /* the screen com
 static float g_half_w = 128.0f;                                /* the frame being drawn: half its width (DS pixels) */
 static id<MTLTexture> final_tex;                               /* both screens, stacked, at scale (mipmapped) */
 static int g_ready;
+
+/* The HD-2D look (Graphics menu): depth of field, bloom, a warm grade and a
+ * vignette on the 3D layer. Off: the picture is exactly the DS's. */
+static int g_hd2d;
+#define BLOOM_LEVELS 5
+static id<MTLTexture> bloom_tex[BLOOM_LEVELS];                 /* DS resolution, then halves */
+static id<MTLTexture> focus_tex[2]; static int focus_cur;      /* the focus distance, eased over frames */
 
 const int* g_gl_scale = &g_scale;
 
@@ -524,10 +619,14 @@ static void make_fbs(void) {
         id<MTLTexture> a = new_tex(MTLPixelFormatRGBA8Unorm, g_fb3_w, g_fb_h, 1, 0);
         id<MTLTexture> d = new_tex(MTLPixelFormatDepth32Float_Stencil8, g_fb3_w, g_fb_h, 1, 0);   /* stencil: the DS's per-pixel flags */
         id<MTLTexture> p = new_tex(MTLPixelFormatRGBA8Unorm, g_fb3_w, g_fb_h, 1, 0);
-        [fb_keep addObjectsFromArray:@[c, a, d, p]];
-        f->color = c; f->attr = a; f->depth = d; f->post = p;
-        f->valid = 0;
+        id<MTLTexture> wd = new_tex(MTLPixelFormatR32Float, g_fb3_w, g_fb_h, 1, 0);
+        id<MTLTexture> hd = new_tex(MTLPixelFormatRGBA8Unorm, g_fb3_w, g_fb_h, 1, 0);
+        [fb_keep addObjectsFromArray:@[c, a, d, p, wd, hd]];
+        f->color = c; f->attr = a; f->depth = d; f->post = p; f->wdepth = wd; f->hd2d = hd;
+        f->valid = f->hd2d_valid = 0;
     }
+    for (int i = 0; i < BLOOM_LEVELS; i++)
+        bloom_tex[i] = new_tex(MTLPixelFormatRGBA16Float, (256 + 2 * g_wside) >> i, 192 >> i, 1, 0);
     final_tex = new_tex(MTLPixelFormatRGBA8Unorm, g_fb3_w, g_fb_h * 2, 1, 1);
     g_fb_latest = g_fb_shown = -1;
 }
@@ -535,6 +634,7 @@ static void make_fbs(void) {
 static void free_fbs(void) {
     for (int i = 0; i < 2; i++) memset(&g_fb[i], 0, sizeof g_fb[i]);
     fb_keep = nil; final_tex = nil;                            /* command buffers in flight keep what they use */
+    for (int i = 0; i < BLOOM_LEVELS; i++) bloom_tex[i] = nil;
 }
 
 /* The largest 3D resolution this GPU can hold: widescreen up to 512 DS
@@ -558,16 +658,22 @@ static void make_samplers(void) {
         samplers[i] = sampler(g_smooth ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest, MTLSamplerMipFilterNotMipmapped, wrap[i / 3], wrap[i % 3]);
 }
 
-static id<MTLRenderPipelineState> pipeline(id<MTLLibrary> lib, NSString* vs, NSString* fs, MTLPixelFormat fmt) {
+static id<MTLRenderPipelineState> pipeline_add(id<MTLLibrary> lib, NSString* vs, NSString* fs, MTLPixelFormat fmt, int add) {
     MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [lib newFunctionWithName:vs];
     d.fragmentFunction = [lib newFunctionWithName:fs];
     d.colorAttachments[0].pixelFormat = fmt;
+    if (add) {                                                 /* added to what is there */
+        d.colorAttachments[0].blendingEnabled = YES;
+        d.colorAttachments[0].sourceRGBBlendFactor = d.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
+        d.colorAttachments[0].sourceAlphaBlendFactor = d.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
+    }
     NSError* err = nil;
     id<MTLRenderPipelineState> p = [dev newRenderPipelineStateWithDescriptor:d error:&err];
     if (!p) fprintf(stderr, "Metal: pipeline %s: %s\n", fs.UTF8String, err.localizedDescription.UTF8String);
     return p;
 }
+static id<MTLRenderPipelineState> pipeline(id<MTLLibrary> lib, NSString* vs, NSString* fs, MTLPixelFormat fmt) { return pipeline_add(lib, vs, fs, fmt, 0); }
 
 /* The polygon pass's pipelines: blending of colour 0, and which channels each target keeps. */
 static id<MTLRenderPipelineState> poly_pipeline(id<MTLLibrary> lib, NSString* fs, int blend, int mask0, int mask1) {
@@ -576,6 +682,8 @@ static id<MTLRenderPipelineState> poly_pipeline(id<MTLLibrary> lib, NSString* fs
     d.fragmentFunction = [lib newFunctionWithName:fs == nil ? @"fs_poly" : fs];
     d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
     d.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    d.colorAttachments[2].pixelFormat = MTLPixelFormatR32Float;
+    d.colorAttachments[2].writeMask = mask1 == 1 ? MTLColorWriteMaskRed : MTLColorWriteMaskNone;   /* the distance: with the pixel's attributes */
     d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
     d.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
     d.colorAttachments[0].writeMask = mask0 ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
@@ -620,6 +728,13 @@ int gl_render_init(int scale) {
     pl_ghost = pipeline(lib, @"vs_quad", @"fs_ghost", MTLPixelFormatRGBA16Float);
     pl_screen = pipeline(lib, @"vs_quad", @"fs_screen", MTLPixelFormatBGRA8Unorm);
     if (!pl_stclear || !pl_post || !pl_comp || !pl_ghost || !pl_screen) return 0;
+    pl_focus = pipeline(lib, @"vs_quad", @"fs_focus", MTLPixelFormatR32Float);
+    pl_dof = pipeline(lib, @"vs_quad", @"fs_dof", MTLPixelFormatRGBA8Unorm);
+    pl_bright = pipeline(lib, @"vs_quad", @"fs_bright", MTLPixelFormatRGBA16Float);
+    pl_down = pipeline(lib, @"vs_quad", @"fs_down", MTLPixelFormatRGBA16Float);
+    pl_up = pipeline_add(lib, @"vs_quad", @"fs_up", MTLPixelFormatRGBA16Float, 1);
+    pl_hd2d = pipeline(lib, @"vs_quad", @"fs_hd2d", MTLPixelFormatRGBA8Unorm);
+    for (int i = 0; i < 2; i++) focus_tex[i] = new_tex(MTLPixelFormatR32Float, 1, 1, 1, 0);
     ds_cache = [NSMutableDictionary dictionary];
     ds_none = [dev newDepthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]];
     make_samplers();
@@ -724,6 +839,68 @@ static void draw(id<MTLRenderCommandEncoder> enc, const DrawState* s, const Poly
     [enc setFragmentBytes:u length:sizeof *u atIndex:0];
     [enc drawPrimitives:prim vertexStart:(NSUInteger)first vertexCount:(NSUInteger)count];
 }
+
+/* one full-target quad pass (rows as under GL) */
+static id<MTLRenderCommandEncoder> quad_pass(id<MTLTexture> target, id<MTLRenderPipelineState> pl, int load) {
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = target;
+    rp.colorAttachments[0].loadAction = load ? MTLLoadActionLoad : MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = [cur_cb() renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:pl];
+    QuadU q = { { -1, -1, 2, 2 }, { 0, 0, 1, 1 }, -1, 0, 0, 0 };
+    [enc setVertexBytes:&q length:sizeof q atIndex:0];
+    return enc;
+}
+static void quad_end(id<MTLRenderCommandEncoder> enc) {
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+    [enc endEncoding];
+}
+
+/* The HD-2D look on the finished 3D layer: post -> depth of field -> + bloom, grade, vignette -> hd2d.
+ * The colour goes through fb->color as scratch (the polygon pass is done with it). */
+static void hd2d_passes(Fb3D* fb) {
+    Hd2dU u = { (float)g_scale, 0.85f, 0.8f, 0 };
+    int prev = focus_cur, cur = focus_cur ^ 1;
+    id<MTLRenderCommandEncoder> enc = quad_pass(focus_tex[cur], pl_focus, 0);
+    [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+    [enc setFragmentTexture:fb->wdepth atIndex:0];
+    [enc setFragmentTexture:focus_tex[prev] atIndex:1];
+    quad_end(enc);
+    focus_cur = cur;
+    enc = quad_pass(fb->color, pl_dof, 0);
+    [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+    [enc setFragmentTexture:fb->post atIndex:0];
+    [enc setFragmentTexture:fb->wdepth atIndex:1];
+    [enc setFragmentTexture:focus_tex[cur] atIndex:2];
+    quad_end(enc);
+    enc = quad_pass(bloom_tex[0], pl_bright, 0);
+    [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+    [enc setFragmentTexture:fb->color atIndex:0];
+    [enc setFragmentSamplerState:smp_linear atIndex:0];
+    quad_end(enc);
+    for (int i = 1; i < BLOOM_LEVELS; i++) {
+        enc = quad_pass(bloom_tex[i], pl_down, 0);
+        [enc setFragmentTexture:bloom_tex[i - 1] atIndex:0];
+        [enc setFragmentSamplerState:smp_linear atIndex:0];
+        quad_end(enc);
+    }
+    for (int i = BLOOM_LEVELS - 2; i >= 0; i--) {
+        enc = quad_pass(bloom_tex[i], pl_up, 1);
+        [enc setFragmentTexture:bloom_tex[i + 1] atIndex:0];
+        [enc setFragmentSamplerState:smp_linear atIndex:0];
+        quad_end(enc);
+    }
+    enc = quad_pass(fb->hd2d, pl_hd2d, 0);
+    [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+    [enc setFragmentTexture:fb->color atIndex:0];
+    [enc setFragmentTexture:bloom_tex[0] atIndex:1];
+    [enc setFragmentSamplerState:smp_linear atIndex:0];
+    quad_end(enc);
+}
+
+void gl_set_hd2d(int on) { g_hd2d = on != 0; }
+int gl_effects(void) { return GL_EFFECT_HD2D; }
 
 static void gl_vblank(void) {
     g_fb_shown = g_fb_latest;                                  /* what was rendered last is visible now */
@@ -832,6 +1009,10 @@ static void gl_render_(const Frame3D* f) {
     rp.colorAttachments[1].loadAction = MTLLoadActionClear;
     rp.colorAttachments[1].clearColor = MTLClearColorMake(((clear >> 24) & 63) / 63.0, (clear >> 15) & 1, 0, 0);
     rp.colorAttachments[1].storeAction = MTLStoreActionStore;
+    rp.colorAttachments[2].texture = fb->wdepth;
+    rp.colorAttachments[2].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[2].clearColor = MTLClearColorMake(1e9, 0, 0, 0);   /* nothing drawn: far away */
+    rp.colorAttachments[2].storeAction = g_hd2d ? MTLStoreActionStore : MTLStoreActionDontCare;
     rp.depthAttachment.texture = fb->depth;
     rp.depthAttachment.loadAction = MTLLoadActionClear;
     rp.depthAttachment.clearDepth = cd;
@@ -973,6 +1154,8 @@ static void gl_render_(const Frame3D* f) {
     [enc setVertexBytes:&q length:sizeof q atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
     [enc endEncoding];
+    fb->hd2d_valid = 0;
+    if (g_hd2d) { hd2d_passes(fb); fb->hd2d_valid = 1; }
     flush(0);                                                   /* the GPU starts on it now */
     fb->valid = 1;
     g_fb_latest = target;
@@ -1016,7 +1199,8 @@ void gl_compose(int a_on_top, int lcd_on) {
             [enc setFragmentTexture:col[eng] atIndex:0];
             [enc setFragmentTexture:c2 atIndex:1];
             [enc setFragmentTexture:info atIndex:2];
-            [enc setFragmentTexture:has3d ? g_fb[g_fb_shown].post : white_tex atIndex:3];
+            Fb3D* sf = has3d ? &g_fb[g_fb_shown] : NULL;
+            [enc setFragmentTexture:!sf ? white_tex : sf->hd2d_valid ? sf->hd2d : sf->post atIndex:3];
             int wide = eng == 0 && has3d && g_wside > 0;           /* the 3D screen, widened; the other in the middle */
             CompU cu = { eng == 0 && has3d, wide, W, (float)g_wside };
             [enc setFragmentBytes:&cu length:sizeof cu atIndex:0];

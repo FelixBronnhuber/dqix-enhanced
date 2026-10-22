@@ -53,4 +53,9 @@ int gl_read_3d(uint8_t* out, int* w, int* h);
 typedef struct { double render_ms, upload_ms; int uploads, polys; long upload_texels; } GlStats;
 extern GlStats g_gl_stats;
 const char* gl_renderer_name(void);
+
+/* Extra looks beyond the DS's (Metal only for now): which this renderer has, and switching them. */
+#define GL_EFFECT_HD2D 1                                      /* depth of field, bloom, a warm grade */
+int gl_effects(void);
+void gl_set_hd2d(int on);
 int gl_render_scale(void);

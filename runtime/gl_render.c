@@ -1314,6 +1314,10 @@ int gl_read_3d(uint8_t* out, int* w, int* h) {
  * none) and the DS pixels added each side. */
 int gl_wide_shown(int* side) { *side = g_wside; return g_wide_shown; }
 
+/* The extra looks (gl_render.h) are Metal only for now. */
+int gl_effects(void) { return 0; }
+void gl_set_hd2d(int on) { (void)on; }
+
 /* ---------------------------------------------------------------- windows */
 /* One context for every window: the first window's. */
 static SDL_GLContext g_ctx;
