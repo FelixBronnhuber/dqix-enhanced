@@ -698,6 +698,10 @@ void session_window_close(void) {
     DestroyWindow(g_ses);
     g_ses = NULL;
 }
+void effects_window_open(SDL_Window* win, GlLook* look, const GlLook* defaults, int* hd2d, int* rt, int rt_available) {
+    (void)win; (void)look; (void)defaults; (void)hd2d; (void)rt; (void)rt_available;
+}
+void effects_window_refresh(void) {}
 #else
 int choice_box(SDL_Window* win, const char* title, const char* text, const char* const* buttons, int n, int def, int cancel,
                const char* check, int* checked) { (void)win; (void)title; (void)text; (void)buttons; (void)n; (void)def; (void)cancel; (void)check; (void)checked; return -1; }
@@ -719,4 +723,8 @@ void controls_window_refresh(void) {}
 void session_window_update(const SessionWindow* w) { (void)w; }
 int session_window_action(void) { return 0; }
 void session_window_close(void) {}
+void effects_window_open(SDL_Window* win, GlLook* look, const GlLook* defaults, int* hd2d, int* rt, int rt_available) {
+    (void)win; (void)look; (void)defaults; (void)hd2d; (void)rt; (void)rt_available;
+}
+void effects_window_refresh(void) {}
 #endif

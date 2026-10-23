@@ -9,6 +9,8 @@
 #include "controls.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stddef.h>
+#include <math.h>
 
 static Uint32 g_evt = (Uint32)-1;                              /* the SDL event a menu item sends */
 static NSMenu* g_bar;
@@ -108,6 +110,7 @@ void menu_init(SDL_Window* win, const char* const* shell_names, int n_shells) {
     sep(gfx);
     item(gfx, MI_HD2D, "&HD-2D look: depth of field, glow, warm colours (Enhanced)");
     item(gfx, MI_RT, "&Ray-traced shadows and shading (Enhanced)");
+    item(gfx, MI_EFFECTS, "Effect &settings...");
 
     NSMenu* scr = top("&Screen");
     item(scr, MI_LCD, "&DS Lite screen\tF6");
@@ -577,4 +580,113 @@ void controls_window_refresh(void) {
     if (!g_ctlw || !g_ctlw.visible) return;
     [g_ctl_table reloadData];
     [g_ctlw makeKeyAndOrderFront:nil];
+}
+
+/* ---- Graphics > Effect settings: sliders for the HD-2D look and the ray tracing, live */
+static NSPanel* g_fx;
+static GlLook* g_fx_look; static const GlLook* g_fx_defaults;
+static int *g_fx_hd2d, *g_fx_rt; static int g_fx_rt_ok;
+typedef struct { const char* name; size_t at; float lo, hi; const char* fmt; int rt; } FxRow;
+static const FxRow FX_ROWS[] = {
+    { "Shadow darkness", offsetof(GlLook, shadow), 0, 1, "%.0f%%", 1 },
+    { "Shading in corners", offsetof(GlLook, shading), 0, 1, "%.0f%%", 1 },
+    { "Shading reach", offsetof(GlLook, reach), 0.02f, 0.25f, "%.2f", 1 },
+    { "Sun: turn", offsetof(GlLook, sun_turn), -180, 180, "%.0f°", 1 },
+    { "Sun: height", offsetof(GlLook, sun_height), 10, 90, "%.0f°", 1 },
+    { "Glow", offsetof(GlLook, bloom), 0, 2, "%.2f", 0 },
+    { "Glow from brightness", offsetof(GlLook, bloom_threshold), 0.4f, 1, "%.2f", 0 },
+    { "Blur (depth of field)", offsetof(GlLook, blur), 0, 2, "%.2f", 0 },
+    { "Focus distance", offsetof(GlLook, focus), 0.5f, 2, "%.2fx", 0 },
+    { "Sharp zone", offsetof(GlLook, focus_band), 0, 0.6f, "%.2f", 0 },
+    { "Tilt-shift", offsetof(GlLook, tilt), 0, 2, "%.2f", 0 },
+    { "Warm colours", offsetof(GlLook, warmth), 0, 2, "%.2f", 0 },
+    { "Vignette", offsetof(GlLook, vignette), 0, 0.8f, "%.2f", 0 },
+};
+#define FX_N ((int)(sizeof FX_ROWS / sizeof FX_ROWS[0]))
+static const float FX_RES[4] = { 0.5f, 1.0f, 1.5f, 2.0f };
+static NSSlider* g_fx_slider[FX_N];
+static NSTextField* g_fx_value[FX_N];
+static NSPopUpButton* g_fx_res;
+static NSButton *g_fx_on_rt, *g_fx_on_hd2d;
+
+static float* fx_field(int i) { return (float*)((char*)g_fx_look + FX_ROWS[i].at); }
+static void fx_show_value(int i) {
+    float v = *fx_field(i);
+    if (strchr(FX_ROWS[i].fmt, '%') && strstr(FX_ROWS[i].fmt, "%%")) v *= 100.0f;   /* shown as a percentage */
+    g_fx_value[i].stringValue = [NSString stringWithFormat:@(FX_ROWS[i].fmt), v];
+}
+
+@interface DqixEffects : NSObject <NSWindowDelegate>
+@end
+@implementation DqixEffects
+- (void)slid:(NSSlider*)s { int i = (int)s.tag; *fx_field(i) = (float)s.doubleValue; fx_show_value(i); }
+- (void)res:(NSPopUpButton*)p { g_fx_look->rt_res = FX_RES[p.indexOfSelectedItem]; }
+- (void)onRt:(NSButton*)b { *g_fx_rt = b.state == NSControlStateValueOn; }
+- (void)onHd2d:(NSButton*)b { *g_fx_hd2d = b.state == NSControlStateValueOn; }
+- (void)defaults:(id)sender { *g_fx_look = *g_fx_defaults; effects_window_refresh(); }
+- (void)close:(id)sender { [g_fx orderOut:nil]; }
+@end
+static DqixEffects* g_fx_target;
+
+void effects_window_open(SDL_Window* win, GlLook* look, const GlLook* defaults, int* hd2d, int* rt, int rt_available) {
+    (void)win;
+    g_fx_look = look; g_fx_defaults = defaults; g_fx_hd2d = hd2d; g_fx_rt = rt; g_fx_rt_ok = rt_available;
+    @autoreleasepool {
+    if (!g_fx) {
+        g_fx_target = [DqixEffects new];
+        const CGFloat row = 28, w = 460;
+        CGFloat h = 16 + 26 + row + 5 * row + 18 + 26 + 8 * row + 16 + 40;
+        NSPanel* p = panel(@"Effect settings", w, h, g_fx_target);
+        CGFloat y = 14;
+        /* the ray tracing */
+        g_fx_on_rt = [NSButton checkboxWithTitle:@"Ray-traced shadows and shading" target:g_fx_target action:@selector(onRt:)];
+        g_fx_on_rt.frame = at(p, 16, y, 300, 20); g_fx_on_rt.font = [NSFont boldSystemFontOfSize:NSFont.systemFontSize];
+        [p.contentView addSubview:g_fx_on_rt];
+        y += 26;
+        text_label(p, at(p, 32, y + 4, 150, 18), @"Resolution");
+        g_fx_res = [[NSPopUpButton alloc] initWithFrame:at(p, 186, y, 220, 24) pullsDown:NO];
+        [g_fx_res addItemsWithTitles:@[@"Half a ray a DS pixel (fastest)", @"1 ray a DS pixel", @"1.5 rays a DS pixel", @"2 rays a DS pixel (sharpest)"]];
+        g_fx_res.target = g_fx_target; g_fx_res.action = @selector(res:);
+        [p.contentView addSubview:g_fx_res];
+        y += row;
+        for (int i = 0; i < FX_N; i++) {
+            if (i == 5) {                                      /* the HD-2D look */
+                y += 18;
+                g_fx_on_hd2d = [NSButton checkboxWithTitle:@"HD-2D look" target:g_fx_target action:@selector(onHd2d:)];
+                g_fx_on_hd2d.frame = at(p, 16, y, 300, 20); g_fx_on_hd2d.font = [NSFont boldSystemFontOfSize:NSFont.systemFontSize];
+                [p.contentView addSubview:g_fx_on_hd2d];
+                y += 26;
+            }
+            text_label(p, at(p, 32, y + 3, 150, 18), S(FX_ROWS[i].name));
+            NSSlider* sl = [NSSlider sliderWithValue:FX_ROWS[i].lo minValue:FX_ROWS[i].lo maxValue:FX_ROWS[i].hi target:g_fx_target action:@selector(slid:)];
+            sl.frame = at(p, 186, y, 200, 24); sl.tag = i; sl.continuous = YES;
+            [p.contentView addSubview:sl];
+            g_fx_slider[i] = sl;
+            g_fx_value[i] = text_label(p, at(p, 394, y + 3, 56, 18), @"");
+            y += row;
+        }
+        button(p, at(p, 16, h - 44, 150, 28), @"Restore defaults", g_fx_target, @selector(defaults:));
+        NSButton* c = button(p, at(p, w - 96, h - 44, 80, 28), @"Close", g_fx_target, @selector(close:));
+        c.keyEquivalent = @"\r";
+        g_fx = p;
+    }
+    effects_window_refresh();
+    [g_fx makeKeyAndOrderFront:nil];
+    }
+}
+
+void effects_window_refresh(void) {
+    if (!g_fx || !g_fx_look) return;
+    g_fx_on_rt.state = *g_fx_rt ? NSControlStateValueOn : NSControlStateValueOff;
+    g_fx_on_rt.enabled = g_fx_rt_ok != 0;
+    g_fx_on_hd2d.state = *g_fx_hd2d ? NSControlStateValueOn : NSControlStateValueOff;
+    int r = 2;
+    for (int k = 0; k < 4; k++) if (fabsf(g_fx_look->rt_res - FX_RES[k]) < 0.01f) r = k;
+    [g_fx_res selectItemAtIndex:r];
+    g_fx_res.enabled = g_fx_rt_ok != 0;
+    for (int i = 0; i < FX_N; i++) {
+        g_fx_slider[i].doubleValue = *fx_field(i);
+        g_fx_slider[i].enabled = !FX_ROWS[i].rt || g_fx_rt_ok;
+        fx_show_value(i);
+    }
 }

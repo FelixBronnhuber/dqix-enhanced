@@ -367,7 +367,7 @@ static const char* MSL =
     "\n"
     /* ---- HD-2D: depth of field, bloom, colour grade, vignette on the 3D layer.
      * Textures hold rows as under GL (row 0 = the bottom of the picture). */
-    "struct Hd2dU { float scale, focus_keep, bloom, pad; };\n"
+    "struct Hd2dU { float scale, focus_keep, bloom, threshold; float blur, focus, band, tilt; float warmth, vignette, p0, p1; };\n"
     /* the focus: the distance at the middle of the picture (where the hero or the
      * monsters are, in front of the background): the nearer third of 15 samples,
      * eased over frames */
@@ -386,20 +386,20 @@ static const char* MSL =
     "  return old <= 0.0 ? m : mix(m, old, u.focus_keep); }\n"
     /* blur size in DS pixels: grows with the distance from the focus, more behind
      * it than in front; plus a little toward the top and bottom (tilt-shift) */
-    "float coc(float w, float f, float ytd) {\n"
-    "  if (w >= 1e8) return 3.0;\n"                              /* nothing drawn there (sky): far */
+    "float coc(float w, float f, float ytd, constant Hd2dU& u) {\n"
+    "  if (w >= 1e8) return 3.0 * u.blur;\n"                      /* nothing drawn there (sky): far */
     "  float d = (w - f) / max(f, 1e-3);\n"
     "  float c = d > 0.0 ? d * 3.0 : -d * 2.5;\n"
-    "  float tilt = smoothstep(0.42, 0.0, ytd) * 1.2 + smoothstep(0.8, 1.0, ytd) * 0.8;\n"
-    "  return clamp(max(c - 0.15, 0.0) + tilt, 0.0, 2.5); }\n"
+    "  float tilt = (smoothstep(0.42, 0.0, ytd) * 1.2 + smoothstep(0.8, 1.0, ytd) * 0.8) * u.tilt;\n"
+    "  return clamp(max(c - u.band, 0.0) + tilt, 0.0, 2.5) * u.blur; }\n"
     "fragment float4 fs_dof(QuadV in [[stage_in]], constant Hd2dU& u [[buffer(0)]], texture2d<float> col [[texture(0)]],\n"
     "                       texture2d<float> wd [[texture(1)]], texture2d<float> foc [[texture(2)]]) {\n"
     "  int2 p = int2(in.pos.xy); int2 sz = int2(col.get_width(), col.get_height());\n"
     "  float4 c0 = col.read(uint2(p));\n"
     "  if (c0.a <= 0.0) return c0;\n"
-    "  float f = foc.read(uint2(0)).r;\n"
+    "  float f = foc.read(uint2(0)).r * u.focus;\n"
     "  float ytd = 1.0 - (float(p.y) + 0.5) / float(sz.y);\n"
-    "  float r0 = coc(wd.read(uint2(p)).a, f, ytd) * u.scale;\n"   /* in pixels of this texture */
+    "  float r0 = coc(wd.read(uint2(p)).a, f, ytd, u) * u.scale;\n"   /* in pixels of this texture */
     "  if (r0 < 0.5) return c0;\n"
     "  float3 sum = c0.rgb; float ws = 1.0;\n"
     "  for (int i = 1; i < 24; i++) {\n"                          /* a golden-angle spiral */
@@ -407,7 +407,7 @@ static const char* MSL =
     "    int2 q = clamp(p + int2(round(float2(cos(a), sin(a)) * rr)), int2(0), sz - 1);\n"
     "    float4 c = col.read(uint2(q));\n"
     "    if (c.a <= 0.0) continue;\n"
-    "    float rq = coc(wd.read(uint2(q)).a, f, 1.0 - (float(q.y) + 0.5) / float(sz.y)) * u.scale;\n"
+    "    float rq = coc(wd.read(uint2(q)).a, f, 1.0 - (float(q.y) + 0.5) / float(sz.y), u) * u.scale;\n"
     "    float k = clamp(min(rq, r0) - rr + 1.0, 0.0, 1.0);\n"   /* a sharp pixel nearby doesn't spread over this one */
     "    sum += c.rgb * k; ws += k;\n"
     "  }\n"
@@ -419,7 +419,7 @@ static const char* MSL =
     "  for (int j = 0; j < 4; j++) for (int i = 0; i < 4; i++) {\n"
     "    float4 c = src.sample(sm, in.uv + (float2(i, j) - 1.5) / 4.0 * dsz);\n"
     "    float l = dot(c.rgb, float3(0.299, 0.587, 0.114));\n"
-    "    acc += c.rgb * smoothstep(0.72, 1.0, l) * step(0.001, c.a);\n"
+    "    acc += c.rgb * smoothstep(u.threshold, 1.0, l) * step(0.001, c.a);\n"
     "  }\n"
     "  return float4(acc / 16.0, 1.0); }\n"
     "fragment float4 fs_down(QuadV in [[stage_in]], texture2d<float> src [[texture(0)]], sampler sm [[sampler(0)]]) {\n"
@@ -443,10 +443,10 @@ static const char* MSL =
     "  float2 uv = in.pos.xy / sz;\n"
     "  float3 c = c0.rgb + bloom.sample(sm, uv).rgb * (u.bloom / 5.0);\n"
     "  float l = dot(c, float3(0.299, 0.587, 0.114));\n"
-    "  c = mix(float3(l), c, 1.12);\n"                             /* a little more colour */
-    "  c *= mix(float3(0.97, 0.99, 1.04), float3(1.03, 1.0, 0.95), smoothstep(0.2, 0.9, l));\n"   /* cool shadows, warm light */
+    "  c = mix(float3(l), c, 1.0 + 0.12 * u.warmth);\n"                             /* a little more colour */
+    "  c *= mix(float3(1.0), mix(float3(0.97, 0.99, 1.04), float3(1.03, 1.0, 0.95), smoothstep(0.2, 0.9, l)), u.warmth);\n"   /* cool shadows, warm light */
     "  float2 v = (uv - 0.5) * float2(1.0, 0.8);\n"
-    "  c *= 1.0 - 0.35 * smoothstep(0.3, 0.75, length(v));\n"
+    "  c *= 1.0 - u.vignette * smoothstep(0.3, 0.75, length(v));\n"
     "  return float4(clamp(c, 0.0, 1.0), c0.a); }\n";
 
 /* Ray-traced shadows and occlusion: per pixel of a G-buffer (view position,
@@ -544,7 +544,7 @@ typedef struct { float edgecol[8][4]; float fogcol[4]; float fogtab[32]; int edg
 typedef struct { float sun[4], sun_col[4]; uint32_t frame, has_sun, ratio, pad; float sun_k, ao_k, ao_r, pad2; } RtU;
 typedef struct { int has3d, wide; float wtot, wside; } CompU;
 typedef struct { float keep, p0, p1, p2; } GhostU;
-typedef struct { float scale, focus_keep, bloom, pad; } Hd2dU;
+typedef struct { float scale, focus_keep, bloom, threshold, blur, focus, band, tilt, warmth, vignette, p0, p1; } Hd2dU;
 typedef struct {
     float view[4], win_canvas[4], top[4], bot[4], ctop[4], cbot[4], topx_botx[4], lid[4], base[4], btn[4], hinge[4], skin_texw_alpha[4];
     int f0[4], f1[4]; float f2[4];
@@ -589,6 +589,7 @@ static id<MTLTexture> focus_tex[2]; static int focus_cur;      /* the focus dist
 
 /* Ray-traced shadows and occlusion (Graphics menu), where the GPU traces rays. */
 static int g_rt, rt_ok;
+static GlLook g_look = GL_LOOK_DEFAULTS;                       /* the settings of both (Graphics > Effect settings) */
 static id<MTLComputePipelineState> cp_trace, cp_blur;
 static id<MTLTexture> rt_raw, rt_shade;                        /* about 1.5x the DS's resolution, see make_fbs */
 static int rt_ratio = 1;                                       /* 3D pixels per ray-traced pixel */
@@ -731,6 +732,7 @@ static id<MTLTexture> texture_for(uint32_t ti, uint32_t pl, int* w, int* h, int*
 }
 
 /* ---------------------------------------------------------------- setup */
+static void make_rt_tex(void);
 static void make_fbs(void) {
     g_fb_w = 256 * g_scale; g_fb_h = 192 * g_scale;
     g_fb3_w = (256 + 2 * g_wside) * g_scale;
@@ -749,7 +751,17 @@ static void make_fbs(void) {
     }
     for (int i = 0; i < BLOOM_LEVELS; i++)
         bloom_tex[i] = new_tex(MTLPixelFormatRGBA16Float, (256 + 2 * g_wside) >> i, 192 >> i, 1, 0);
-    rt_ratio = (g_scale * 2 + 2) / 3;                          /* rays for about 1.3-1.5x the DS's pixels (they are blurred anyway) */
+    make_rt_tex();
+    final_tex = new_tex(MTLPixelFormatRGBA8Unorm, g_fb3_w, g_fb_h * 2, 1, 1);
+    g_fb_latest = g_fb_shown = -1;
+}
+
+/* The ray-traced shade's textures: rays for rt_res DS pixels across each DS
+ * pixel (Effect settings: 0.5 to 2; they are blurred anyway). */
+static void make_rt_tex(void) {
+    float r = g_look.rt_res > 0 ? g_look.rt_res : 1.5f;
+    rt_ratio = (int)lroundf((float)g_scale / r);
+    if (rt_ratio < 1) rt_ratio = 1;
     if (rt_ok) {
         int w = (g_fb3_w + rt_ratio - 1) / rt_ratio, h = (g_fb_h + rt_ratio - 1) / rt_ratio;
         MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:(NSUInteger)w height:(NSUInteger)h mipmapped:NO];
@@ -758,8 +770,6 @@ static void make_fbs(void) {
         d.pixelFormat = MTLPixelFormatR16Float;
         rt_shade = [dev newTextureWithDescriptor:d];
     }
-    final_tex = new_tex(MTLPixelFormatRGBA8Unorm, g_fb3_w, g_fb_h * 2, 1, 1);
-    g_fb_latest = g_fb_shown = -1;
 }
 
 static void free_fbs(void) {
@@ -1001,7 +1011,8 @@ static void quad_end(id<MTLRenderCommandEncoder> enc) {
 /* The HD-2D look on the finished 3D layer: post -> depth of field -> + bloom, grade, vignette -> hd2d.
  * The colour goes through fb->color as scratch (the polygon pass is done with it). */
 static void hd2d_passes(Fb3D* fb) {
-    Hd2dU u = { (float)g_scale, 0.85f, 0.8f, 0 };
+    const GlLook* L = &g_look;
+    Hd2dU u = { (float)g_scale, 0.85f, L->bloom, L->bloom_threshold, L->blur, L->focus, L->focus_band, L->tilt, L->warmth, L->vignette, 0, 0 };
     int prev = focus_cur, cur = focus_cur ^ 1;
     id<MTLRenderCommandEncoder> enc = quad_pass(focus_tex[cur], pl_focus, 0);
     [enc setFragmentBytes:&u length:sizeof u atIndex:0];
@@ -1042,6 +1053,11 @@ static void hd2d_passes(Fb3D* fb) {
 
 void gl_set_hd2d(int on) { g_hd2d = on != 0; }
 void gl_set_rt(int on) { g_rt = on != 0; }
+void gl_set_look(const GlLook* l) {
+    int res = l->rt_res != g_look.rt_res;
+    g_look = *l;
+    if (res && g_ready) make_rt_tex();                          /* a new ray resolution: its textures */
+}
 int gl_effects(void) { return GL_EFFECT_HD2D | (rt_ok ? GL_EFFECT_RT : 0); }
 
 /* Ray tracing on this frame's solid triangles (view space): shadows from the
@@ -1110,12 +1126,13 @@ static int rt_passes(Fb3D* fb, const Frame3D* f, int nb) {
      * doesn't (vertex colours, toon shading), so then a sun of our own: above,
      * a little to the left and behind the camera, so shadows fall away from the
      * viewer and the same way on screen as the camera turns. */
-    float sun[3] = { -0.35f, 0.85f, 0.40f }, sl = 0;
+    float az = g_look.sun_turn * 3.14159265f / 180.0f, el = g_look.sun_height * 3.14159265f / 180.0f;
+    float sun[3] = { cosf(el) * sinf(az), sinf(el), cosf(el) * cosf(az) }, sl = 0;   /* turn 0 = from behind the camera */
     if (f->has_sun) memcpy(sun, f->sun, sizeof sun);
     for (int c = 0; c < 3; c++) sl += sun[c] * sun[c];
     sl = 1.0f / sqrtf(sl);
     RtU u = { { sun[0] * sl, sun[1] * sl, sun[2] * sl, 0 }, { 1, 1, 1, 0 },
-              (uint32_t)g_frameno, 1, (uint32_t)rt_ratio, 0, 0.55f, 0.6f, 0.08f, 0 };
+              (uint32_t)g_frameno, 1, (uint32_t)rt_ratio, 0, g_look.shadow, g_look.shading, g_look.reach, 0 };
     id<MTLComputeCommandEncoder> ce = [cur_cb() computeCommandEncoder];
     [ce setComputePipelineState:cp_trace];
     [ce setBytes:&u length:sizeof u atIndex:0];

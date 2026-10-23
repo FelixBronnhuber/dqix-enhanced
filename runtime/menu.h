@@ -3,6 +3,7 @@
  * chosen, and shows check marks. Elsewhere the functions do nothing. */
 #pragma once
 #include "SDL.h"
+#include "gl_render.h"
 
 enum {
     MI_PAUSE = 100, MI_TURBO, MI_SHOT, MI_REPORT, MI_EXIT, MI_DLC,
@@ -19,7 +20,7 @@ enum {
     MI_WIDE_DYN = 240, MI_SINGLE, MI_RESET, MI_VOLUME, MI_MUTE, MI_CONTROLS_EDIT,
     MI_CORNER0 = 250,                                                   /* + 0..3: top left, top right, bottom right, bottom left */
     MI_SSIZE0 = 254,                                                    /* + 0..2: small, medium, large */
-    MI_HD2D = 260, MI_RT,
+    MI_HD2D = 260, MI_RT, MI_EFFECTS,
     MI_SEND_REPORT = 210,
 };
 
@@ -78,3 +79,9 @@ void controls_window_open(SDL_Window* win);
 int controls_window_request(int* action, int* what);
 void controls_window_refresh(void);                    /* 0 nothing, 1 start, 2 cancel (each reported once) */
 void session_window_close(void);
+
+/* Graphics > Effect settings (macOS): sliders for the HD-2D look and the
+ * ray tracing, changing *look (and the two switches) live; Restore defaults
+ * puts *defaults back. Elsewhere nothing. */
+void effects_window_open(SDL_Window* win, GlLook* look, const GlLook* defaults, int* hd2d, int* rt, int rt_available);
+void effects_window_refresh(void);                  /* the values changed elsewhere (menu) */

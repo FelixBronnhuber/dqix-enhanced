@@ -60,4 +60,17 @@ const char* gl_renderer_name(void);
 int gl_effects(void);
 void gl_set_hd2d(int on);
 void gl_set_rt(int on);
+/* Their settings (Graphics > Effect settings; settings.ini fx_*). */
+typedef struct {
+    float rt_res;                 /* rays across each DS pixel: 0.5, 1, 1.5, 2 */
+    float shadow, shading;        /* how dark sun shadows and shading in corners get: 0..1 */
+    float reach;                  /* how far the shading looks: part of the distance, 0.02..0.25 */
+    float sun_turn, sun_height;   /* where our sun is (degrees): turn 0 = behind the camera, -90 = from the left; height above the horizon */
+    float bloom, bloom_threshold; /* glow: 0..2; from what brightness: 0.4..1 */
+    float blur, focus, focus_band;/* depth of field: blur 0..2; focus distance (x the automatic one) 0.5..2; sharp zone 0..0.6 */
+    float tilt;                   /* tilt-shift: extra blur toward the top and bottom, 0..2 */
+    float warmth, vignette;       /* colour: 0..2; darker corners: 0..0.8 */
+} GlLook;
+#define GL_LOOK_DEFAULTS { 1.5f, 0.55f, 0.6f, 0.08f, -41.0f, 58.0f, 0.8f, 0.72f, 1.0f, 1.0f, 0.15f, 1.0f, 1.0f, 0.35f }
+void gl_set_look(const GlLook* look);
 int gl_render_scale(void);

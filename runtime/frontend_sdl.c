@@ -20,6 +20,7 @@
  * A game controller works too (Nintendo layout by position: right face button = A). */
 #define SDL_MAIN_HANDLED
 #include "SDL.h"
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,6 +63,15 @@ static int g_wide_pop;                                            /* widescreen:
 static int g_smooth = 0;                                          /* Enhanced: smooth (filtered) textures */
 static int g_hd2d = 0;                                            /* Enhanced: the HD-2D look (depth of field, bloom; Metal) */
 static int g_rt = 0;                                              /* Enhanced: ray-traced shadows and occlusion (Metal) */
+static GlLook g_look = GL_LOOK_DEFAULTS;                          /* ...and their settings (Graphics > Effect settings) */
+static const struct { const char* key; size_t at; } LOOK_KEYS[] = {   /* settings.ini fx_* */
+    { "fx_rt_resolution", offsetof(GlLook, rt_res) }, { "fx_shadow", offsetof(GlLook, shadow) },
+    { "fx_shading", offsetof(GlLook, shading) }, { "fx_shading_reach", offsetof(GlLook, reach) },
+    { "fx_sun_turn", offsetof(GlLook, sun_turn) }, { "fx_sun_height", offsetof(GlLook, sun_height) },
+    { "fx_bloom", offsetof(GlLook, bloom) }, { "fx_bloom_threshold", offsetof(GlLook, bloom_threshold) },
+    { "fx_blur", offsetof(GlLook, blur) }, { "fx_focus", offsetof(GlLook, focus) }, { "fx_focus_band", offsetof(GlLook, focus_band) },
+    { "fx_tilt_shift", offsetof(GlLook, tilt) }, { "fx_warmth", offsetof(GlLook, warmth) }, { "fx_vignette", offsetof(GlLook, vignette) },
+};
 static int g_res_auto = 1;                                        /* 3D resolution: as sharp as the screen shows it (else g_scale3d) */
 static int g_small_opacity = 50;                                  /* widescreen: how solid the small screen over the field is (O), % */
 static int g_wide_dyn;                                            /* widescreen: 0 basic (the corner stays), 1 dynamic (experimental: slides for menus) */
@@ -408,6 +418,10 @@ static void settings_load(void) {
         else if (!strcmp(key, "smooth_textures")) g_smooth = atoi(val) != 0;
         else if (!strcmp(key, "hd2d")) g_hd2d = atoi(val) != 0;
         else if (!strcmp(key, "rt_lighting")) g_rt = atoi(val) != 0;
+        else if (!strncmp(key, "fx_", 3)) {
+            for (size_t i = 0; i < sizeof LOOK_KEYS / sizeof LOOK_KEYS[0]; i++)
+                if (!strcmp(key, LOOK_KEYS[i].key)) *(float*)((char*)&g_look + LOOK_KEYS[i].at) = (float)atof(val);
+        }
         else if (!strcmp(key, "small_screen_opacity")) { int v = atoi(val); if (v >= 10 && v <= 100) opacity_saved = v; }
         else if (!strcmp(key, "second_window")) { int r[4]; if (sscanf(val, "%d,%d,%d,%d", &r[0], &r[1], &r[2], &r[3]) == 4 && r[2] > 0 && r[3] > 0) memcpy(g_win2_rect, r, sizeof r); }
         else if (!strcmp(key, "second_window_fullscreen")) g_win2_full = atoi(val) != 0;
@@ -460,6 +474,9 @@ static void settings_save(void) {
     fprintf(f, "hd2d = %d\n", g_hd2d);
     fprintf(f, "# enhanced: ray-traced shadows from the sun and shading in corners (macOS for now): 0 or 1\n");
     fprintf(f, "rt_lighting = %d\n", g_rt);
+    fprintf(f, "# their settings (Graphics > Effect settings)\n");
+    for (size_t i = 0; i < sizeof LOOK_KEYS / sizeof LOOK_KEYS[0]; i++)
+        fprintf(f, "%s = %g\n", LOOK_KEYS[i].key, *(const float*)((const char*)&g_look + LOOK_KEYS[i].at));
     fprintf(f, "# widescreen: the small screen (map, battle commands) in a window of its own: 0 or 1\n");
     fprintf(f, "widescreen_popout = %d\n", g_wide_pop);
     fprintf(f, "# window size: 1 to 8 times the DS screens (F3)\n");
@@ -615,6 +632,7 @@ static int try_gl(void) {
     gl_set_hd2d(g_hd2d);
     if (getenv("DQIX_RT")) g_rt = atoi(getenv("DQIX_RT")) != 0;             /* tests */
     gl_set_rt(g_rt);
+    gl_set_look(&g_look);
     if (!gl_render_init(g_res_auto ? (getenv("DQIX_AUTO_FROM") ? 2 : 4) : g_scale3d)) {
         fprintf(stderr, "OpenGL renderer failed to start: using the software renderer\n");
         gfx_detach(g_win); SDL_DestroyWindow(g_win); g_win = NULL; return 0;
@@ -1056,6 +1074,11 @@ static void auto_scale(void) {
 
 static void present_gl(void) {
     auto_scale();
+    {   /* the effects, as the Effect settings window may have just changed them */
+        static int hd = -1, rt = -1;
+        gl_set_look(&g_look);
+        if (hd != g_hd2d || rt != g_rt) { hd = g_hd2d; rt = g_rt; gl_set_hd2d(g_hd2d); gl_set_rt(g_rt); menu_sync(); }
+    }
     g_wide_side = g_classic ? 0 : wide_side_target();            /* the next 3D frames (only the picture changes) */
     {   /* ...and what the game counts as in view (not in a session: every PC must decide alike) */
         static int off = -1; if (off < 0) off = getenv("DQIX_NO_WIDE_CULL") != NULL;
@@ -1186,6 +1209,7 @@ static void menu_sync(void) {
     menu_check(MI_SMOOTH, g_smooth); menu_enable(MI_SMOOTH, g_gl && !g_classic);
     menu_check(MI_HD2D, g_hd2d); menu_enable(MI_HD2D, g_gl && !g_classic && (gl_effects() & GL_EFFECT_HD2D));
     menu_check(MI_RT, g_rt); menu_enable(MI_RT, g_gl && !g_classic && (gl_effects() & GL_EFFECT_RT));
+    menu_enable(MI_EFFECTS, g_gl && !g_classic && gl_effects());
     menu_check(MI_LCD, g_opt.lcd); menu_enable(MI_LCD, g_gl);
     int lcd = g_gl && g_opt.lcd;
     menu_check(MI_LCDCOL, g_opt.lcd_color); menu_enable(MI_LCDCOL, lcd);
@@ -1744,8 +1768,11 @@ static void do_action(int id) {
         break;
     case MI_RES_AUTO: if (g_gl && !g_classic) g_res_auto = 1; break;          /* auto_scale() picks it */
     case MI_SMOOTH: if (g_gl) { g_smooth = !g_smooth; gl_set_smooth(g_smooth); } break;
-    case MI_HD2D: if (g_gl && (gl_effects() & GL_EFFECT_HD2D)) { g_hd2d = !g_hd2d; gl_set_hd2d(g_hd2d); } break;
-    case MI_RT: if (g_gl && (gl_effects() & GL_EFFECT_RT)) { g_rt = !g_rt; gl_set_rt(g_rt); } break;
+    case MI_HD2D: if (g_gl && (gl_effects() & GL_EFFECT_HD2D)) { g_hd2d = !g_hd2d; gl_set_hd2d(g_hd2d); } effects_window_refresh(); break;
+    case MI_RT: if (g_gl && (gl_effects() & GL_EFFECT_RT)) { g_rt = !g_rt; gl_set_rt(g_rt); } effects_window_refresh(); break;
+    case MI_EFFECTS:
+        if (g_win && g_gl && gl_effects()) { static const GlLook defaults = GL_LOOK_DEFAULTS; effects_window_open(g_win, &g_look, &defaults, &g_hd2d, &g_rt, (gl_effects() & GL_EFFECT_RT) != 0); }
+        break;
     case MI_POPOUT:
         if (!g_gl) break;
         if (g_wide && !g_side_by_side) g_wide_pop = !g_wide_pop;
