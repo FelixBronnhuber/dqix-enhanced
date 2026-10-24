@@ -61,8 +61,8 @@ static SDL_Window* g_win2;                                        /* ...the seco
 static int g_win2_full, g_win2_rect[4];                           /* ...fullscreen; where it was as a window (w = 0: not yet) */
 static int g_wide_pop;                                            /* widescreen: the small screen in its own window (the field alone) */
 static int g_smooth = 0;                                          /* Enhanced: smooth (filtered) textures */
-static int g_hd2d = 0;                                            /* Enhanced: the HD-2D look (depth of field, bloom; Metal) */
-static int g_rt = 0;                                              /* Enhanced: ray-traced shadows and occlusion (Metal) */
+static int g_hd2d = 0;                                            /* Enhanced: the HD-2D look (depth of field, bloom) */
+static int g_rt = 0;                                              /* Enhanced: ray-traced shadows and occlusion */
 static GlLook g_look = GL_LOOK_DEFAULTS;                          /* ...and their settings (Graphics > Effect settings) */
 static const struct { const char* key; size_t at; } LOOK_KEYS[] = {   /* settings.ini fx_* */
     { "fx_rt_resolution", offsetof(GlLook, rt_res) }, { "fx_shadow", offsetof(GlLook, shadow) },
@@ -470,9 +470,9 @@ static void settings_save(void) {
     fprintf(f, "resolution_3d = %d\n", g_res_auto || g_scale3d > 4 ? 4 : g_scale3d);   /* for versions before v29 */
     fprintf(f, "# enhanced: smooth textures (filtered) instead of the DS's blocky texels: 0 or 1\n");
     fprintf(f, "smooth_textures = %d\n", g_smooth);
-    fprintf(f, "# enhanced: the HD-2D look (depth of field, glow, warm colours; macOS for now): 0 or 1\n");
+    fprintf(f, "# enhanced: the HD-2D look (depth of field, glow, warm colours; Ctrl+H): 0 or 1\n");
     fprintf(f, "hd2d = %d\n", g_hd2d);
-    fprintf(f, "# enhanced: ray-traced shadows from the sun and shading in corners (macOS for now): 0 or 1\n");
+    fprintf(f, "# enhanced: ray-traced shadows from the sun and shading in corners (Ctrl+L): 0 or 1\n");
     fprintf(f, "rt_lighting = %d\n", g_rt);
     fprintf(f, "# their settings (Graphics > Effect settings)\n");
     for (size_t i = 0; i < sizeof LOOK_KEYS / sizeof LOOK_KEYS[0]; i++)
@@ -1075,9 +1075,13 @@ static void auto_scale(void) {
 static void present_gl(void) {
     auto_scale();
     {   /* the effects, as the Effect settings window may have just changed them */
-        static int hd = -1, rt = -1;
+        static int hd = -1, rt = -1, quiet;
+        static GlLook seen; static int have_seen;
         gl_set_look(&g_look);
-        if (hd != g_hd2d || rt != g_rt) { hd = g_hd2d; rt = g_rt; gl_set_hd2d(g_hd2d); gl_set_rt(g_rt); menu_sync(); }
+        if (hd != g_hd2d || rt != g_rt) { hd = g_hd2d; rt = g_rt; gl_set_hd2d(g_hd2d); gl_set_rt(g_rt); menu_sync(); quiet = 60; }
+        if (!have_seen) { seen = g_look; have_seen = 1; quiet = 0; }
+        if (memcmp(&seen, &g_look, sizeof g_look)) { seen = g_look; quiet = 60; }   /* a slider moved: saved once it rests */
+        else if (quiet > 0 && --quiet == 0) settings_save();
     }
     g_wide_side = g_classic ? 0 : wide_side_target();            /* the next 3D frames (only the picture changes) */
     {   /* ...and what the game counts as in view (not in a session: every PC must decide alike) */
@@ -1930,6 +1934,15 @@ static void hotkey(int a) {
     case CA_RESET: do_action(MI_RESET); break;
     case CA_SHOT: do_action(MI_SHOT); break;
     case CA_REPORT: do_action(MI_REPORT); break;
+    case CA_HD2D: case CA_RT: {                                  /* (no menu bar on Linux: these keys are the way there) */
+        int bit = a == CA_HD2D ? GL_EFFECT_HD2D : GL_EFFECT_RT;
+        const char* name = a == CA_HD2D ? "HD-2D look" : "Ray-traced shadows and shading";
+        if (!g_gl || g_classic) { notice("%s: Enhanced mode only (F5)", name); break; }
+        if (!(gl_effects() & bit)) { notice("%s: not available on this graphics card", name); break; }
+        do_action(a == CA_HD2D ? MI_HD2D : MI_RT);
+        notice("%s %s", name, (a == CA_HD2D ? g_hd2d : g_rt) ? "on" : "off");
+        break;
+    }
     }
 }
 

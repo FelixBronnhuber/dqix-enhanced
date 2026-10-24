@@ -94,6 +94,7 @@
     X(void, glSamplerParameteri, (GLuint, GLenum, GLint)) \
     X(void, glBindSampler, (GLuint, GLuint)) \
     X(void, glLineWidth, (GLfloat)) \
+    X(void, glTexBuffer, (GLenum, GLenum, GLuint)) \
     X(GLenum, glGetError, (void)) \
     X(void, glFinish, (void))
 
@@ -108,23 +109,24 @@ static int load_gl(void) {
     return 1;
 }
 
-#define VTX_FLOATS 18                    /* floats per vertex sent to the GPU */
+#define VTX_FLOATS 21                    /* floats per vertex sent to the GPU (the last 3: view-space position) */
 
 /* ---------------------------------------------------------------- shaders */
 static const char* VS_POLY =
     "#version 330 core\n"
-    "in vec4 a_pos; in vec4 a_color; in vec2 a_tex; in vec4 a_attr; in vec4 a_edge;\n"
-    "out vec4 v_color; out vec2 v_tex; flat out vec4 v_attr; noperspective out vec3 v_bary; flat out int v_ext;\n"
+    "in vec4 a_pos; in vec4 a_color; in vec2 a_tex; in vec4 a_attr; in vec4 a_edge; in vec3 a_vpos;\n"
+    "out vec4 v_color; out vec2 v_tex; flat out vec4 v_attr; noperspective out vec3 v_bary; flat out int v_ext; out vec3 v_vpos;\n"
     "uniform vec2 u_texsize;\n"
     "void main() { gl_Position = a_pos; v_color = a_color; v_tex = a_tex / u_texsize; v_attr = a_attr;\n"
-    "  v_bary = a_edge.xyz; v_ext = int(a_edge.w + 0.5); }\n";
+    "  v_bary = a_edge.xyz; v_ext = int(a_edge.w + 0.5); v_vpos = a_vpos; }\n";
 
 /* DS pixel pipeline, in 5-bit color steps like the hardware. */
 static const char* FS_POLY =
     "#version 330 core\n"
-    "in vec4 v_color; in vec2 v_tex; flat in vec4 v_attr; noperspective in vec3 v_bary; flat in int v_ext;\n"
+    "in vec4 v_color; in vec2 v_tex; flat in vec4 v_attr; noperspective in vec3 v_bary; flat in int v_ext; in vec3 v_vpos;\n"
     "layout(location = 0) out vec4 o_color;\n"
     "layout(location = 1) out vec4 o_attr;\n"
+    "layout(location = 2) out vec4 o_g;\n"         /* only with the effects on (a third target): view position, distance */
     "uniform sampler2D u_tex;\n"
     "uniform int u_highlight; uniform int u_alphatest; uniform float u_aref; uniform int u_wbuf; uniform float u_edgew;\n"
     "uniform int u_part;\n"
@@ -156,6 +158,7 @@ static const char* FS_POLY =
     "  float fa = a >= 31 ? 1.0 : float(a) / 31.0;\n"
     "  o_color = vec4(vec3(c) / 31.0, fa);\n"                  /* straight colour and alpha, like the DS's buffer */
     "  o_attr = vec4(v_attr.z, v_attr.w, eflag, 1.0);\n"
+    "  o_g = vec4(v_vpos, 1.0 / gl_FragCoord.w);\n"
     "  gl_FragDepth = u_wbuf != 0 ? clamp((1.0 / gl_FragCoord.w) / 4096.0, 0.0, 1.0) : gl_FragCoord.z;\n"
     "}\n";
 
@@ -174,9 +177,12 @@ static const char* FS_POST =
     "uniform int u_edge; uniform vec3 u_edgecol[8]; uniform int u_scale; uniform int u_aa;\n"
     "uniform int u_fog; uniform int u_fog_alpha_only; uniform vec4 u_fogcol; uniform float u_fogtab[32];\n"
     "uniform int u_fogoff; uniform int u_fogshift; uniform int u_wbuf;\n"
+    "uniform int u_rt; uniform sampler2D u_shade;\n"   /* ray tracing: 0 off, 1 on, 2 the shade alone (tests) */
     "void main() {\n"
     "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
     "  vec4 c = texelFetch(u_color, p, 0); vec4 at = texelFetch(u_attr, p, 0);\n"
+    "  if (u_rt != 0 && c.a > 0.0) { float sh = texture(u_shade, (vec2(p) + 0.5) / vec2(textureSize(u_color, 0))).r;\n"
+    "    c.rgb = u_rt == 2 ? vec3(sh) : c.rgb * sh; }\n"   /* ray-traced shadows, occlusion */
     "  if (u_edge != 0 && at.b > 0.5 && at.a > 0.5) {\n"
     "    float id = at.r; float d = texelFetch(u_depth, p, 0).r;\n"
     "    ivec2 sz = textureSize(u_color, 0);\n"
@@ -507,6 +513,213 @@ static const char* FS_GHOST =
     "void main() { vec3 c = pow(texture(u_cur, v_uv).rgb, vec3(2.2)); vec3 p = texture(u_prev, v_uv).rgb;\n"
     "  o_color = vec4(mix(c, p, u_keep), 1.0); }\n";
 
+/* HD-2D: depth of field, bloom, colour grade, vignette on the 3D layer (as
+ * metal_render.m). Row 0 of each texture is the bottom of the picture. */
+/* the focus: the distance at the middle of the picture (where the hero or the
+ * monsters are, in front of the background): the nearer third of 15 samples,
+ * eased over frames */
+static const char* FS_FOCUS =
+    "#version 330 core\n"
+    "out vec4 o_color; uniform sampler2D u_wd, u_prev; uniform float u_keep;\n"
+    "void main() {\n"
+    "  float v[15]; int n = 0;\n"
+    "  vec2 sz = vec2(textureSize(u_wd, 0));\n"
+    "  for (int j = 0; j < 3; j++) for (int i = 0; i < 5; i++) {\n"
+    "    vec2 t = vec2(0.34 + 0.08 * float(i), 1.0 - (0.45 + 0.12 * float(j)));\n"   /* x across, y from the top */
+    "    float w = texelFetch(u_wd, ivec2(t * sz), 0).a;\n"
+    "    if (w < 1e8) v[n++] = w;\n"
+    "  }\n"
+    "  float old = texelFetch(u_prev, ivec2(0), 0).r;\n"
+    "  if (n == 0) { o_color = vec4(old); return; }\n"
+    "  for (int a = 1; a < n; a++) for (int b = a; b > 0 && v[b - 1] > v[b]; b--) { float t = v[b]; v[b] = v[b - 1]; v[b - 1] = t; }\n"
+    "  float m = v[n / 3];\n"
+    "  o_color = vec4(old <= 0.0 ? m : mix(m, old, u_keep)); }\n";
+
+/* blur size in DS pixels: grows with the distance from the focus, more behind
+ * it than in front; plus a little toward the top and bottom (tilt-shift) */
+static const char* FS_DOF =
+    "#version 330 core\n"
+    "out vec4 o_color; uniform sampler2D u_col, u_wd, u_foc;\n"
+    "uniform float u_scale, u_blur, u_focus, u_band, u_tilt;\n"
+    "float coc(float w, float f, float ytd) {\n"
+    "  if (w >= 1e8) return 3.0 * u_blur;\n"                      /* nothing drawn there (sky): far */
+    "  float d = (w - f) / max(f, 1e-3);\n"
+    "  float c = d > 0.0 ? d * 3.0 : -d * 2.5;\n"
+    "  float tilt = ((1.0 - smoothstep(0.0, 0.42, ytd)) * 1.2 + smoothstep(0.8, 1.0, ytd) * 0.8) * u_tilt;\n"
+    "  return clamp(max(c - u_band, 0.0) + tilt, 0.0, 2.5) * u_blur; }\n"
+    "void main() {\n"
+    "  ivec2 p = ivec2(gl_FragCoord.xy); ivec2 sz = textureSize(u_col, 0);\n"
+    "  vec4 c0 = texelFetch(u_col, p, 0);\n"
+    "  if (c0.a <= 0.0) { o_color = c0; return; }\n"
+    "  float f = texelFetch(u_foc, ivec2(0), 0).r * u_focus;\n"
+    "  float ytd = 1.0 - (float(p.y) + 0.5) / float(sz.y);\n"
+    "  float r0 = coc(texelFetch(u_wd, p, 0).a, f, ytd) * u_scale;\n"   /* in pixels of this texture */
+    "  if (r0 < 0.5) { o_color = c0; return; }\n"
+    "  vec3 sum = c0.rgb; float ws = 1.0;\n"
+    "  for (int i = 1; i < 24; i++) {\n"                          /* a golden-angle spiral */
+    "    float rr = sqrt(float(i) / 24.0) * r0, a = float(i) * 2.39996;\n"
+    "    ivec2 q = clamp(p + ivec2(round(vec2(cos(a), sin(a)) * rr)), ivec2(0), sz - 1);\n"
+    "    vec4 c = texelFetch(u_col, q, 0);\n"
+    "    if (c.a <= 0.0) continue;\n"
+    "    float rq = coc(texelFetch(u_wd, q, 0).a, f, 1.0 - (float(q.y) + 0.5) / float(sz.y)) * u_scale;\n"
+    "    float k = clamp(min(rq, r0) - rr + 1.0, 0.0, 1.0);\n"   /* a sharp pixel nearby doesn't spread over this one */
+    "    sum += c.rgb * k; ws += k;\n"
+    "  }\n"
+    "  o_color = vec4(sum / ws, c0.a); }\n";
+
+/* bloom: the bright parts, down to a few sizes and back up */
+static const char* FS_BRIGHT =
+    "#version 330 core\n"
+    "in vec2 v_uv; out vec4 o_color; uniform sampler2D u_src; uniform float u_scale, u_threshold;\n"
+    "void main() {\n"
+    "  vec2 dsz = u_scale / vec2(textureSize(u_src, 0));\n"     /* one DS pixel (this texel) in the source */
+    "  vec3 acc = vec3(0.0);\n"
+    "  for (int j = 0; j < 4; j++) for (int i = 0; i < 4; i++) {\n"
+    "    vec4 c = texture(u_src, v_uv + (vec2(i, j) - 1.5) / 4.0 * dsz);\n"
+    "    float l = dot(c.rgb, vec3(0.299, 0.587, 0.114));\n"
+    "    acc += c.rgb * smoothstep(u_threshold, 1.0, l) * step(0.001, c.a);\n"
+    "  }\n"
+    "  o_color = vec4(acc / 16.0, 1.0); }\n";
+static const char* FS_DOWN =
+    "#version 330 core\n"
+    "in vec2 v_uv; out vec4 o_color; uniform sampler2D u_src;\n"
+    "void main() {\n"
+    "  vec2 d = 1.0 / vec2(textureSize(u_src, 0));\n"
+    "  o_color = vec4((texture(u_src, v_uv + vec2(-d.x, -d.y)).rgb + texture(u_src, v_uv + vec2(d.x, -d.y)).rgb +\n"
+    "                  texture(u_src, v_uv + vec2(-d.x, d.y)).rgb + texture(u_src, v_uv + vec2(d.x, d.y)).rgb) * 0.25, 1.0); }\n";
+static const char* FS_UP =
+    "#version 330 core\n"
+    "in vec2 v_uv; out vec4 o_color; uniform sampler2D u_src;\n"
+    "void main() {\n"
+    "  vec2 d = 1.0 / vec2(textureSize(u_src, 0)), uv = v_uv;\n"
+    "  vec3 c = texture(u_src, uv).rgb * 4.0;\n"                 /* a tent: smooth when it grows */
+    "  c += (texture(u_src, uv + vec2(d.x, 0)).rgb + texture(u_src, uv - vec2(d.x, 0)).rgb + texture(u_src, uv + vec2(0, d.y)).rgb + texture(u_src, uv - vec2(0, d.y)).rgb) * 2.0;\n"
+    "  c += texture(u_src, uv + d).rgb + texture(u_src, uv - d).rgb + texture(u_src, uv + vec2(d.x, -d.y)).rgb + texture(u_src, uv - vec2(d.x, -d.y)).rgb;\n"
+    "  o_color = vec4(c / 16.0, 1.0); }\n";                      /* added to what is there */
+/* the finish: bloom added, a warm grade, a vignette */
+static const char* FS_HD2D =
+    "#version 330 core\n"
+    "out vec4 o_color; uniform sampler2D u_col, u_bloom; uniform float u_bloomk, u_warmth, u_vignette;\n"
+    "void main() {\n"
+    "  vec2 sz = vec2(textureSize(u_col, 0));\n"
+    "  vec4 c0 = texelFetch(u_col, ivec2(gl_FragCoord.xy), 0);\n"
+    "  if (c0.a <= 0.0) { o_color = c0; return; }\n"
+    "  vec2 uv = gl_FragCoord.xy / sz;\n"
+    "  vec3 c = c0.rgb + texture(u_bloom, uv).rgb * (u_bloomk / 5.0);\n"
+    "  float l = dot(c, vec3(0.299, 0.587, 0.114));\n"
+    "  c = mix(vec3(l), c, 1.0 + 0.12 * u_warmth);\n"                               /* a little more colour */
+    "  c *= mix(vec3(1.0), mix(vec3(0.97, 0.99, 1.04), vec3(1.03, 1.0, 0.95), smoothstep(0.2, 0.9, l)), u_warmth);\n"   /* cool shadows, warm light */
+    "  vec2 v = (uv - 0.5) * vec2(1.0, 0.8);\n"
+    "  c *= 1.0 - u_vignette * smoothstep(0.3, 0.75, length(v));\n"
+    "  o_color = vec4(clamp(c, 0.0, 1.0), c0.a); }\n";
+
+/* Ray-traced shadows and occlusion: per pixel of the G-buffer (view position;
+ * the normal from the neighbours), one ray toward the sun and a few short ones
+ * around, against the frame's own triangles; then a depth-aware blur into a
+ * shade factor. GL has no ray tracing of its own: the triangles go into a
+ * bounding volume hierarchy (built on the CPU each frame, see rt_passes) that
+ * this shader walks. Texture buffers:
+ *   nodes: 2 texels each: (min, first), (max, count); count 0: children first, first + 1
+ *   tris:  3 texels each: (corner, cut-out index or -1) x 3
+ *   cuts:  3 texels each: texel coordinates s x 3, t x 3, then (mask offset, w, h, wrap)
+ *   bits:  the cut-out textures' masks, 1 bit a texel (solid) */
+static const char* FS_RT_TRACE =
+    "#version 330 core\n"
+    "out vec4 o_color;\n"
+    "uniform sampler2D u_gpos; uniform samplerBuffer u_nodes, u_tris, u_cuts; uniform usamplerBuffer u_bits;\n"
+    "uniform vec3 u_sun; uniform int u_frame, u_has_sun, u_ratio; uniform float u_ao_r;\n"
+    "float wrap1(float x, float n, int m) {\n"                      /* 0 clamp, 1 repeat, 2 mirrored repeat */
+    "  if (m == 0) return clamp(x, 0.0, n - 1.0);\n"
+    "  if (m == 1) return x - n * floor(x / n);\n"
+    "  float y = x - 2.0 * n * floor(x / (2.0 * n)); return y < n ? y : 2.0 * n - 1.0 - y; }\n"
+    "bool solid_at(int cut, float bu, float bv) {\n"
+    "  vec4 s = texelFetch(u_cuts, cut * 3), t = texelFetch(u_cuts, cut * 3 + 1), c = texelFetch(u_cuts, cut * 3 + 2);\n"
+    "  float w0 = 1.0 - bu - bv;\n"
+    "  float ss = s.x * w0 + s.y * bu + s.z * bv, tt = t.x * w0 + t.y * bu + t.z * bv;\n"
+    "  int w = int(c.y), h = int(c.z), wrap = int(c.w);\n"
+    "  int x = clamp(int(wrap1(floor(ss), float(w), wrap / 3)), 0, w - 1), y = clamp(int(wrap1(floor(tt), float(h), wrap % 3)), 0, h - 1);\n"
+    "  int i = y * w + x;\n"
+    "  return ((texelFetch(u_bits, int(c.x) + (i >> 3)).r >> uint(i & 7)) & 1u) != 0u; }\n"
+    /* the nearest (or any, for shadows) hit beyond tmin, cut-outs by their texels; -1 if none */
+    "float hit(vec3 o, vec3 d, float tmin, float tmax, bool any) {\n"
+    "  vec3 inv = 1.0 / vec3(abs(d.x) > 1e-12 ? d.x : 1e-12, abs(d.y) > 1e-12 ? d.y : 1e-12, abs(d.z) > 1e-12 ? d.z : 1e-12);\n"
+    "  float best = tmax; bool found = false;\n"
+    "  int stack[64]; int sp = 0; stack[sp++] = 0;\n"
+    "  while (sp > 0) {\n"
+    "    int ni = stack[--sp];\n"
+    "    vec4 a = texelFetch(u_nodes, ni * 2), b = texelFetch(u_nodes, ni * 2 + 1);\n"
+    "    vec3 t0 = (a.xyz - o) * inv, t1 = (b.xyz - o) * inv, lo = min(t0, t1), hi = max(t0, t1);\n"
+    "    if (max(max(lo.x, lo.y), max(lo.z, tmin)) > min(min(hi.x, hi.y), min(hi.z, best))) continue;\n"
+    "    int first = int(a.w), cnt = int(b.w);\n"
+    "    if (cnt == 0) { if (sp < 63) { stack[sp++] = first + 1; stack[sp++] = first; } continue; }\n"
+    "    for (int k = first; k < first + cnt; k++) {\n"                /* Moller-Trumbore, both sides */
+    "      vec4 p0 = texelFetch(u_tris, k * 3);\n"
+    "      vec3 e1 = texelFetch(u_tris, k * 3 + 1).xyz - p0.xyz, e2 = texelFetch(u_tris, k * 3 + 2).xyz - p0.xyz, pv = cross(d, e2);\n"
+    "      float det = dot(e1, pv);\n"
+    "      if (det == 0.0) continue;\n"
+    "      float id = 1.0 / det; vec3 tv = o - p0.xyz;\n"
+    "      float u = dot(tv, pv) * id; if (u < 0.0 || u > 1.0) continue;\n"
+    "      vec3 qv = cross(tv, e1); float v = dot(d, qv) * id; if (v < 0.0 || u + v > 1.0) continue;\n"
+    "      float t = dot(e2, qv) * id; if (t < tmin || t >= best) continue;\n"
+    "      if (p0.w >= 0.0 && !solid_at(int(p0.w), u, v)) continue;\n"
+    "      best = t; found = true;\n"
+    "      if (any) return t;\n"
+    "    }\n"
+    "  }\n"
+    "  return found ? best : -1.0; }\n"
+    "uint pcg(uint v) { uint s = v * 747796405u + 2891336453u; uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u; return (w >> 22u) ^ w; }\n"
+    "float rnd(inout uint st) { st = pcg(st); return float(st) / 4294967296.0; }\n"
+    "vec3 around(vec3 n, float a, float b) {\n"                     /* cosine-weighted around n */
+    "  float r = sqrt(a), ph = 6.2831853 * b;\n"
+    "  vec3 t = abs(n.x) > 0.5 ? vec3(0, 1, 0) : vec3(1, 0, 0);\n"
+    "  vec3 x = normalize(cross(t, n)), y = cross(n, x);\n"
+    "  return normalize(x * (r * cos(ph)) + y * (r * sin(ph)) + n * sqrt(max(1.0 - a, 0.0))); }\n"
+    "void main() {\n"
+    "  ivec2 gid = ivec2(gl_FragCoord.xy), gs = textureSize(u_gpos, 0);\n"
+    "  ivec2 c = min(gid * u_ratio + u_ratio / 2, gs - 1);\n"
+    "  vec4 g = texelFetch(u_gpos, c, 0);\n"
+    "  if (g.w >= 1e8 || g.w <= 0.0) { o_color = vec4(1.0, 1.0, 0.0, 0.0); return; }\n"   /* nothing drawn */
+    "  vec3 p = g.xyz;\n"
+    "  vec3 xa = texelFetch(u_gpos, min(c + ivec2(1, 0), gs - 1), 0).xyz - p, xb = p - texelFetch(u_gpos, max(c - ivec2(1, 0), ivec2(0)), 0).xyz;\n"
+    "  vec3 ya = texelFetch(u_gpos, min(c + ivec2(0, 1), gs - 1), 0).xyz - p, yb = p - texelFetch(u_gpos, max(c - ivec2(0, 1), ivec2(0)), 0).xyz;\n"
+    "  vec3 n = cross(abs(xa.z) < abs(xb.z) ? xa : xb, abs(ya.z) < abs(yb.z) ? ya : yb);\n"   /* the face's normal */
+    "  n = dot(n, n) > 0.0 ? normalize(n) : vec3(0.0, 0.0, 1.0);\n"
+    "  if (dot(n, -p) < 0.0) n = -n;\n"
+    "  float dist = max(length(p), 1e-3), eps = dist * 0.003;\n"
+    "  uint st = pcg(uint(gid.x) * 1973u + uint(gid.y) * 9277u + uint(u_frame) * 26699u);\n"
+    "  float vis = 1.0, ndl = 0.0;\n"
+    "  if (u_has_sun != 0) {\n"
+    "    ndl = dot(n, u_sun);\n"
+    "    if (ndl > 0.0) {\n"
+    "      vec3 d = normalize(u_sun + (vec3(rnd(st), rnd(st), rnd(st)) - 0.5) * 0.06);\n"   /* a sun of some size: soft edges */
+    "      vis = hit(p + n * eps, d, eps, 1e7, true) < 0.0 ? 1.0 : 0.0;\n"
+    "    }\n"
+    "  }\n"
+    "  float rad = u_ao_r * dist, occ = 0.0;\n"                     /* occlusion: as far as a fraction of the distance */
+    "  for (int k = 0; k < 4; k++) {\n"
+    "    float ra = rnd(st), rb = rnd(st);\n"
+    "    float d = hit(p + n * eps, around(n, ra, rb), eps, rad, false);\n"
+    "    if (d >= 0.0) occ += 1.0 - d / rad;\n"
+    "  }\n"
+    "  o_color = vec4(vis, 1.0 - occ / 4.0, max(ndl, 0.0), dist); }\n";
+static const char* FS_RT_BLUR =
+    "#version 330 core\n"
+    "out vec4 o_color; uniform sampler2D u_raw; uniform float u_sun_k, u_ao_k;\n"
+    "void main() {\n"
+    "  ivec2 gid = ivec2(gl_FragCoord.xy), sz = textureSize(u_raw, 0);\n"
+    "  vec4 c = texelFetch(u_raw, gid, 0);\n"
+    "  if (c.w <= 0.0) { o_color = vec4(1.0); return; }\n"
+    "  float vis = 0.0, ao = 0.0, ws = 0.0;\n"
+    "  for (int j = -2; j <= 2; j++) for (int i = -2; i <= 2; i++) {\n"
+    "    vec4 t = texelFetch(u_raw, clamp(gid + ivec2(i, j), ivec2(0), sz - 1), 0);\n"
+    "    if (t.w <= 0.0) continue;\n"
+    "    float w = exp(-abs(t.w - c.w) / (c.w * 0.03)) * exp(-float(i * i + j * j) / 6.0);\n"   /* same surface, nearby */
+    "    vis += t.x * w; ao += t.y * w; ws += w;\n"
+    "  }\n"
+    "  vis /= ws; ao /= ws;\n"
+    "  float shadow = (1.0 - vis) * smoothstep(0.0, 0.3, c.z) * u_sun_k;\n"   /* only where the sun would reach */
+    "  o_color = vec4((1.0 - shadow) * mix(1.0, ao, u_ao_k)); }\n";
+
 static GLuint compile(GLenum type, const char* src) {
     GLuint s = p_glCreateShader(type);
     p_glShaderSource(s, 1, &src, NULL);
@@ -524,6 +737,7 @@ static GLuint program(const char* vs, const char* fs, int poly) {
     if (poly) {
         p_glBindAttribLocation(p, 0, "a_pos"); p_glBindAttribLocation(p, 1, "a_color");
         p_glBindAttribLocation(p, 2, "a_tex"); p_glBindAttribLocation(p, 3, "a_attr"); p_glBindAttribLocation(p, 4, "a_edge");
+        p_glBindAttribLocation(p, 5, "a_vpos");
     } else p_glBindAttribLocation(p, 0, "a_pos");
     p_glLinkProgram(p);
     GLint ok; p_glGetProgramiv(p, GL_LINK_STATUS, &ok);
@@ -543,7 +757,9 @@ static GLuint white_tex;
 typedef struct {
     GLuint fbo, color, attr, depth;                            /* polygon pass */
     GLuint post_fbo, post;                                     /* after edge marking / fog */
-    int valid;
+    GLuint wdepth;                                             /* effects on: view position + distance (a third target of the pass) */
+    GLuint scratch_fbo, hd2d_fbo, hd2d;                        /* ...the colour alone (depth of field), the HD-2D picture */
+    int valid, hd2d_valid;
 } Fb3D;
 static Fb3D g_fb[2];
 static int g_fb_latest = -1, g_fb_shown = -1;                  /* rendered last / visible this frame */
@@ -556,10 +772,27 @@ static GLuint tex_col[2], tex_c2, tex_info;                   /* 2D inputs (per 
 static GLuint final_fbo, final_tex;                            /* both screens, stacked, at scale */
 static int g_ready;
 
+/* The extra looks (Graphics menu), off at first. Off, nothing of them is made
+ * or drawn: the frame is exactly as before. Their buffers (fx_*) exist only
+ * while one is on. */
+static int g_hd2d, g_rt;                                       /* the HD-2D look; ray-traced shadows and occlusion */
+static int hd2d_ok, rt_ok;                                     /* their shaders compiled */
+static GlLook g_look = GL_LOOK_DEFAULTS;                       /* the settings of both (Graphics > Effect settings) */
+static int fx_on;                                              /* the buffers below exist, for this size */
+static GLuint prog_focus, prog_dof, prog_bright, prog_down, prog_up, prog_hd2d, prog_trace, prog_rtblur;
+static GLuint smp_linear;
+#define BLOOM_LEVELS 5
+static GLuint bloom_tex[BLOOM_LEVELS], bloom_fbo[BLOOM_LEVELS];   /* DS resolution, then halves */
+static GLuint focus_tex[2], focus_fbo[2]; static int focus_cur;   /* the focus distance, eased over frames */
+static GLuint rt_raw, rt_raw_fbo, rt_shade, rt_shade_fbo;       /* the rays' resolution (Effect settings) */
+static int rt_w, rt_h, rt_ratio = 1;                           /* ...and 3D pixels per ray-traced pixel */
+static GLuint rt_buf[4], rt_tbo[4];                            /* texture buffers: nodes, triangles, cut-outs, masks (FS_RT_TRACE) */
+static GLint rt_tbo_max = 65536;                               /* texels a texture buffer can hold */
+
 const int* g_gl_scale = &g_scale;
 
 /* ---------------------------------------------------------------- textures */
-typedef struct { uint32_t ti, pl; uint64_t hash; GLuint tex; int w, h; uint64_t checked, used; int live; } TexEntry;
+typedef struct { uint32_t ti, pl; uint64_t hash; GLuint tex; int w, h; uint64_t checked, used; int live, holes; uint8_t* mask; } TexEntry;   /* holes: see-through texels, mask: 1 bit a texel, solid (ray tracing) */
 #define TEXCACHE 4096
 static TexEntry g_texcache[TEXCACHE];
 static int g_smooth;                                           /* smooth textures (bilinear filtering) */
@@ -579,6 +812,7 @@ static TexEntry* tex_lookup(uint32_t ti, uint32_t pl) {
         TexEntry* lru = NULL;
         for (int k = 0; k < 16; k++) { TexEntry* e = &g_texcache[(h + (uint32_t)k) & (TEXCACHE - 1)]; if (!lru || e->used < lru->used) lru = e; }
         p_glDeleteTextures(1, &lru->tex);
+        free(lru->mask);
         lru->live = 0;
         free_slot = lru;
     }
@@ -620,7 +854,7 @@ static void bleed(uint8_t* px, int w, int h) {
     for (size_t i = 0; i < (size_t)w * h; i++) if (px[i * 4 + 3] == 1) px[i * 4 + 3] = 0;
 }
 
-static GLuint texture_for(uint32_t ti, uint32_t pl, int* w, int* h) {
+static GLuint texture_for(uint32_t ti, uint32_t pl, int* w, int* h, int* holes, const uint8_t** mask) {
     TexEntry* e = tex_lookup(ti, pl);
     gpu3d_tex_size(ti, w, h);
     e->used = g_frameno;
@@ -631,12 +865,18 @@ static GLuint texture_for(uint32_t ti, uint32_t pl, int* w, int* h) {
             double t0 = perf_ms();
             e->hash = hs; e->w = *w; e->h = *h;
             gpu3d_decode_texture(ti, pl, g_decode);
+            e->holes = 0;                                       /* ray tracing: which texels cast a shadow */
+            for (size_t i = 0; i < (size_t)*w * *h && !e->holes; i++) e->holes = g_decode[i * 4 + 3] == 0;
+            free(e->mask); e->mask = NULL;
+            if (e->holes && (e->mask = calloc(((size_t)*w * *h + 7) / 8, 1)))
+                for (size_t i = 0; i < (size_t)*w * *h; i++) if (g_decode[i * 4 + 3]) e->mask[i >> 3] |= (uint8_t)(1 << (i & 7));
             if (g_smooth) bleed(g_decode, *w, *h);
             p_glBindTexture(GL_TEXTURE_2D, e->tex);
             p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, *w, *h, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_decode);
             g_gl_stats.uploads++; g_gl_stats.upload_texels += *w * *h; g_gl_stats.upload_ms += perf_ms() - t0;
         }
     }
+    *holes = e->holes; *mask = e->mask;
     return e->tex;
 }
 
@@ -682,7 +922,80 @@ static void make_fbs(void) {
     g_fb_latest = g_fb_shown = -1;
 }
 
+/* a framebuffer drawing into tex alone */
+static GLuint fbo_for(GLuint tex) {
+    GLuint f; p_glGenFramebuffers(1, &f);
+    p_glBindFramebuffer(GL_FRAMEBUFFER, f);
+    p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    return f;
+}
+
+/* The ray-traced shade's textures: rays for rt_res DS pixels across each DS
+ * pixel (Effect settings: 0.5 to 2; they are blurred anyway). */
+static void free_rt_tex(void) {
+    if (!rt_raw) return;
+    GLuint t[2] = { rt_raw, rt_shade }, b[2] = { rt_raw_fbo, rt_shade_fbo };
+    p_glDeleteTextures(2, t); p_glDeleteFramebuffers(2, b);
+    rt_raw = rt_shade = rt_raw_fbo = rt_shade_fbo = 0;
+}
+static void make_rt_tex(void) {
+    free_rt_tex();
+    float r = g_look.rt_res > 0 ? g_look.rt_res : 1.5f;
+    rt_ratio = (int)lroundf((float)g_scale / r);
+    if (rt_ratio < 1) rt_ratio = 1;
+    if (!rt_ok) return;
+    rt_w = (g_fb3_w + rt_ratio - 1) / rt_ratio; rt_h = (g_fb_h + rt_ratio - 1) / rt_ratio;
+    rt_raw = new_tex(GL_RGBA16F, rt_w, rt_h, GL_RGBA, GL_FLOAT, GL_NEAREST);
+    rt_shade = new_tex(GL_R16F, rt_w, rt_h, GL_RED, GL_FLOAT, GL_LINEAR);
+    rt_raw_fbo = fbo_for(rt_raw); rt_shade_fbo = fbo_for(rt_shade);
+    p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+/* The effects' buffers for the current size: a third target of the polygon
+ * pass (view position, distance), the HD-2D picture, bloom, ray tracing. */
+static void make_fx(void) {
+    for (int i = 0; i < 2; i++) {
+        Fb3D* f = &g_fb[i];
+        f->wdepth = new_tex(GL_RGBA32F, g_fb3_w, g_fb_h, GL_RGBA, GL_FLOAT, GL_NEAREST);
+        p_glBindFramebuffer(GL_FRAMEBUFFER, f->fbo);
+        p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, f->wdepth, 0);
+        GLenum bufs[3] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2 };
+        p_glDrawBuffers(3, bufs);
+        if (p_glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) fprintf(stderr, "GL: 3D framebuffer with effects incomplete\n");
+        f->hd2d = new_tex(GL_RGBA8, g_fb3_w, g_fb_h, GL_RGBA, GL_UNSIGNED_BYTE, GL_NEAREST);
+        f->hd2d_fbo = fbo_for(f->hd2d);
+        f->scratch_fbo = fbo_for(f->color);
+        f->hd2d_valid = 0;
+    }
+    for (int i = 0; i < BLOOM_LEVELS; i++) {
+        bloom_tex[i] = new_tex(GL_RGBA16F, (256 + 2 * g_wside) >> i, 192 >> i, GL_RGBA, GL_FLOAT, GL_LINEAR);
+        bloom_fbo[i] = fbo_for(bloom_tex[i]);
+    }
+    make_rt_tex();
+    p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    fx_on = 1;
+}
+static void free_fx(void) {
+    if (!fx_on) return;
+    for (int i = 0; i < 2; i++) {
+        Fb3D* f = &g_fb[i];
+        p_glBindFramebuffer(GL_FRAMEBUFFER, f->fbo);              /* the polygon pass as it was: two targets */
+        p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, 0, 0);
+        GLenum bufs[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+        p_glDrawBuffers(2, bufs);
+        GLuint t[2] = { f->wdepth, f->hd2d }, b[2] = { f->hd2d_fbo, f->scratch_fbo };
+        p_glDeleteTextures(2, t); p_glDeleteFramebuffers(2, b);
+        f->wdepth = f->hd2d = f->hd2d_fbo = f->scratch_fbo = 0;
+        f->hd2d_valid = 0;
+    }
+    p_glDeleteTextures(BLOOM_LEVELS, bloom_tex); p_glDeleteFramebuffers(BLOOM_LEVELS, bloom_fbo);
+    free_rt_tex();
+    p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    fx_on = 0;
+}
+
 static void free_fbs(void) {
+    free_fx();
     for (int i = 0; i < 2; i++) {
         Fb3D* f = &g_fb[i];
         GLuint t[4] = { f->color, f->attr, f->depth, f->post }, b[2] = { f->fbo, f->post_fbo };
@@ -718,7 +1031,8 @@ int gl_render_init(int scale) {
     p_glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, (void*)(8 * sizeof(float)));
     p_glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, stride, (void*)(10 * sizeof(float)));
     p_glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, stride, (void*)(14 * sizeof(float)));
-    for (int i = 0; i < 5; i++) p_glEnableVertexAttribArray((GLuint)i);
+    p_glVertexAttribPointer(5, 3, GL_FLOAT, GL_FALSE, stride, (void*)(18 * sizeof(float)));
+    for (int i = 0; i < 6; i++) p_glEnableVertexAttribArray((GLuint)i);
     static const float quad[12] = { 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1 };
     p_glGenVertexArrays(1, &vao_quad); p_glBindVertexArray(vao_quad);
     p_glGenBuffers(1, &vbo_quad); p_glBindBuffer(GL_ARRAY_BUFFER, vbo_quad);
@@ -743,6 +1057,46 @@ int gl_render_init(int scale) {
     g_decode = malloc(1024 * 1024 * 4);
     p_glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     p_glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    /* the extra looks: without them (a shader this driver won't take) the game is as it is */
+    prog_focus = program(VS_QUAD, FS_FOCUS, 0);
+    prog_dof = program(VS_QUAD, FS_DOF, 0);
+    prog_bright = program(VS_QUAD, FS_BRIGHT, 0);
+    prog_down = program(VS_QUAD, FS_DOWN, 0);
+    prog_up = program(VS_QUAD, FS_UP, 0);
+    prog_hd2d = program(VS_QUAD, FS_HD2D, 0);
+    hd2d_ok = prog_focus && prog_dof && prog_bright && prog_down && prog_up && prog_hd2d;
+    if (!getenv("DQIX_NO_RT")) {
+        prog_trace = program(VS_QUAD, FS_RT_TRACE, 0);
+        prog_rtblur = program(VS_QUAD, FS_RT_BLUR, 0);
+        rt_ok = prog_trace && prog_rtblur;
+    }
+    if (!hd2d_ok || (!rt_ok && !getenv("DQIX_NO_RT"))) fprintf(stderr, "GL: effects not available:%s%s\n", hd2d_ok ? "" : " HD-2D", rt_ok ? "" : " ray tracing");
+    p_glGenSamplers(1, &smp_linear);
+    p_glSamplerParameteri(smp_linear, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    p_glSamplerParameteri(smp_linear, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    p_glSamplerParameteri(smp_linear, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    p_glSamplerParameteri(smp_linear, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (hd2d_ok) {
+        static const float zero = 0.0f;
+        for (int i = 0; i < 2; i++) {
+            focus_tex[i] = new_tex(GL_R32F, 1, 1, GL_RED, GL_FLOAT, GL_NEAREST);
+            p_glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RED, GL_FLOAT, &zero);   /* no focus yet */
+            focus_fbo[i] = fbo_for(focus_tex[i]);
+        }
+        p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+    if (rt_ok) {
+        static const GLenum fmt[4] = { GL_RGBA32F, GL_RGBA32F, GL_RGBA32F, GL_R8UI };
+        p_glGetIntegerv(GL_MAX_TEXTURE_BUFFER_SIZE, &rt_tbo_max);
+        p_glGenBuffers(4, rt_buf); p_glGenTextures(4, rt_tbo);
+        for (int i = 0; i < 4; i++) {
+            p_glBindBuffer(GL_TEXTURE_BUFFER, rt_buf[i]);
+            p_glBufferData(GL_TEXTURE_BUFFER, 16, NULL, GL_STREAM_DRAW);
+            p_glBindTexture(GL_TEXTURE_BUFFER, rt_tbo[i]);
+            p_glTexBuffer(GL_TEXTURE_BUFFER, fmt[i], rt_buf[i]);
+        }
+        p_glBindBuffer(GL_TEXTURE_BUFFER, 0); p_glBindTexture(GL_TEXTURE_BUFFER, 0);
+    }
     make_fbs();
     g_ready = 1;
     snprintf(g_gl_name, sizeof g_gl_name, "%s / %s / OpenGL %s", (const char*)p_glGetString(GL_VENDOR),
@@ -797,6 +1151,7 @@ static void push_vertex(int* nv, const SVtx* v, float alpha, const Poly* p, floa
     o[12] = (float)((p->attr >> 24) & 63) / 63.0f; o[13] = (float)((p->attr >> 15) & 1);
     o[14] = corner == 0; o[15] = corner == 1; o[16] = corner == 2;       /* lines: all 0 = always an edge */
     o[17] = (float)ext;
+    o[18] = v->vx; o[19] = v->vy; o[20] = v->vz;
     (*nv)++;
 }
 
@@ -804,8 +1159,285 @@ static void push_vertex(int* nv, const SVtx* v, float alpha, const Poly* p, floa
 #define ST_TRANS 0x40                    /* a translucent polygon is on it (its id: bits 0-4, of the DS's 0-5) */
 #define ST_MASKBIT 0x20                  /* marked by the latest shadow mask */
 #define ST_ID 0x1F
-typedef struct { int first, count; GLuint tex; int sampler; float tw, th; int translucent, depth_write, depth_eq, lines, pid, shadow, fog, alpha1; } Batch;
+typedef struct { int first, count; GLuint tex; int sampler; float tw, th; int translucent, depth_write, depth_eq, lines, pid, shadow, fog, alpha1, holes, mask_off; } Batch;
 static Batch* g_batches; static int g_bcap;
+
+/* The polygon pass's third target (effects on): written with the pixel's attributes. */
+static void mask2(int on) { if (fx_on) p_glColorMaski(2, on, on, on, on); }
+
+/* ---------------------------------------------------------------- ray tracing */
+static uint8_t* rt_bits; static size_t rt_bits_n, rt_bits_cap;  /* this frame's cut-out masks */
+static const uint8_t* rt_bits_src[256]; static uint32_t rt_bits_at[256]; static int rt_bits_k;
+/* a cut-out texture's mask in this frame's buffer (once a frame each); -1 if it won't fit */
+static int rt_mask(const uint8_t* m, int w, int h) {
+    for (int i = 0; i < rt_bits_k; i++) if (rt_bits_src[i] == m) return (int)rt_bits_at[i];
+    size_t n = ((size_t)w * h + 7) / 8;
+    if (rt_bits_n + n > (size_t)rt_tbo_max || rt_bits_n + n > (1u << 24)) return -1;   /* (offsets are floats in the shader) */
+    if (rt_bits_n + n > rt_bits_cap) { rt_bits_cap = (rt_bits_n + n) * 2; rt_bits = realloc(rt_bits, rt_bits_cap); }
+    memcpy(rt_bits + rt_bits_n, m, n);
+    int at = (int)rt_bits_n; rt_bits_n += n;
+    if (rt_bits_k < 256) { rt_bits_src[rt_bits_k] = m; rt_bits_at[rt_bits_k++] = (uint32_t)at; }
+    return at;
+}
+
+/* The frame's triangles (view space) and a bounding volume hierarchy over
+ * them, built each frame: binned surface area heuristic, a few triangles a leaf. */
+typedef struct { float v[9]; float cut; float lo[3], hi[3], c[3]; } RtTri;   /* cut: index into rt_cuts, -1 solid */
+typedef struct { float s[3], t[3]; float off, w, h, wrap; } RtCut;
+typedef struct { float lo[3], hi[3]; int first, count; } RtNode;              /* count 0: children at first, first + 1 */
+static RtTri* rt_tri; static size_t rt_tri_n, rt_tri_cap;
+static RtCut* rt_cuts; static size_t rt_cuts_n, rt_cuts_cap;
+static RtNode* rt_node; static int rt_node_n;
+static int* rt_idx;
+static float* rt_up; static size_t rt_up_cap;                  /* what goes to the GPU */
+
+static float area3(const float* lo, const float* hi) {
+    float d[3] = { hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2] };
+    return d[0] < 0 ? 0 : d[0] * d[1] + d[1] * d[2] + d[2] * d[0];
+}
+static void bvh_build(int ni, int start, int end, int depth) {
+    RtNode* n = &rt_node[ni];
+    float clo[3] = { 1e30f, 1e30f, 1e30f }, chi[3] = { -1e30f, -1e30f, -1e30f };
+    for (int k = 0; k < 3; k++) { n->lo[k] = 1e30f; n->hi[k] = -1e30f; }
+    for (int i = start; i < end; i++) {
+        const RtTri* t = &rt_tri[rt_idx[i]];
+        for (int k = 0; k < 3; k++) {
+            if (t->lo[k] < n->lo[k]) n->lo[k] = t->lo[k];
+            if (t->hi[k] > n->hi[k]) n->hi[k] = t->hi[k];
+            if (t->c[k] < clo[k]) clo[k] = t->c[k];
+            if (t->c[k] > chi[k]) chi[k] = t->c[k];
+        }
+    }
+    int cnt = end - start;
+    n->first = start; n->count = cnt;
+    if (cnt <= 2 || depth >= 48) return;                       /* (the shader's stack holds 64) */
+    int ax = 0;
+    for (int k = 1; k < 3; k++) if (chi[k] - clo[k] > chi[ax] - clo[ax]) ax = k;
+    float ext = chi[ax] - clo[ax];
+    if (ext <= 1e-9f) return;                                  /* all in one place */
+    enum { NB = 12 };
+    int bn[NB] = { 0 }; float blo[NB][3], bhi[NB][3];
+    for (int b = 0; b < NB; b++) for (int k = 0; k < 3; k++) { blo[b][k] = 1e30f; bhi[b][k] = -1e30f; }
+    for (int i = start; i < end; i++) {
+        const RtTri* t = &rt_tri[rt_idx[i]];
+        int b = (int)((t->c[ax] - clo[ax]) / ext * NB); if (b >= NB) b = NB - 1;
+        bn[b]++;
+        for (int k = 0; k < 3; k++) { if (t->lo[k] < blo[b][k]) blo[b][k] = t->lo[k]; if (t->hi[k] > bhi[b][k]) bhi[b][k] = t->hi[k]; }
+    }
+    float rcost[NB]; int rn[NB];                               /* from the right: bins b.. */
+    {   float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f }; int c = 0;
+        for (int b = NB - 1; b > 0; b--) {
+            c += bn[b];
+            for (int k = 0; k < 3; k++) { if (blo[b][k] < lo[k]) lo[k] = blo[b][k]; if (bhi[b][k] > hi[k]) hi[k] = bhi[b][k]; }
+            rcost[b] = c ? area3(lo, hi) * (float)c : 0; rn[b] = c;
+        }
+    }
+    float best = 1e30f; int split = -1;
+    {   float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f }; int c = 0;
+        for (int b = 0; b < NB - 1; b++) {
+            c += bn[b];
+            for (int k = 0; k < 3; k++) { if (blo[b][k] < lo[k]) lo[k] = blo[b][k]; if (bhi[b][k] > hi[k]) hi[k] = bhi[b][k]; }
+            if (!c || !rn[b + 1]) continue;
+            float cost = area3(lo, hi) * (float)c + rcost[b + 1];
+            if (cost < best) { best = cost; split = b; }
+        }
+    }
+    if (split < 0 || (cnt <= 6 && best >= area3(n->lo, n->hi) * (float)cnt)) return;   /* a leaf is as good */
+    int mid = start;
+    for (int i = start; i < end; i++) {
+        const RtTri* t = &rt_tri[rt_idx[i]];
+        int b = (int)((t->c[ax] - clo[ax]) / ext * NB); if (b >= NB) b = NB - 1;
+        if (b <= split) { int s = rt_idx[i]; rt_idx[i] = rt_idx[mid]; rt_idx[mid++] = s; }
+    }
+    if (mid == start || mid == end) return;
+    int l = rt_node_n; rt_node_n += 2;
+    n->first = l; n->count = 0;                                /* (n stays valid: the nodes were allocated up front) */
+    bvh_build(l, start, mid, depth + 1);
+    bvh_build(l + 1, mid, end, depth + 1);
+}
+
+/* one texture buffer's new contents */
+static void tbo_fill(int i, const void* data, size_t bytes) {
+    p_glBindBuffer(GL_TEXTURE_BUFFER, rt_buf[i]);
+    p_glBufferData(GL_TEXTURE_BUFFER, (GLsizeiptr)(bytes ? bytes : 16), bytes ? data : NULL, GL_STREAM_DRAW);
+}
+
+static void bind_tex(int unit, GLenum target, GLuint tex, GLuint smp) {
+    p_glActiveTexture(GL_TEXTURE0 + (GLenum)unit); p_glBindTexture(target, tex); p_glBindSampler((GLuint)unit, smp);
+}
+/* a full-target quad with the current program */
+static void quad_draw(GLuint prog) {
+    p_glUniform4f(p_glGetUniformLocation(prog, "u_rect"), -1, -1, 2, 2);
+    p_glUniform4f(p_glGetUniformLocation(prog, "u_uv"), 0, 0, 1, 1);
+    p_glBindVertexArray(vao_quad);
+    p_glDrawArrays(GL_TRIANGLES, 0, 6);
+}
+static void pass_to(GLuint fbo, int w, int h, GLuint prog) {
+    p_glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    p_glViewport(0, 0, w, h);
+    p_glUseProgram(prog);
+}
+static void unbind_units(int n) {
+    for (int i = n - 1; i >= 0; i--) { p_glActiveTexture(GL_TEXTURE0 + (GLenum)i); p_glBindSampler((GLuint)i, 0); p_glBindTexture(GL_TEXTURE_BUFFER, 0); }
+}
+
+/* Ray tracing on this frame's solid triangles (view space): shadows from the
+ * sun, occlusion; the shade factor goes to rt_shade. 0 if nothing to trace. */
+static int rt_passes(Fb3D* fb, const Frame3D* f, int nb) {
+    rt_tri_n = rt_cuts_n = 0;
+    for (int i = 0; i < nb; i++) {
+        const Batch* b = &g_batches[i];
+        if (b->translucent || b->lines || b->shadow) continue;
+        if (b->holes && b->mask_off < 0) continue;              /* no mask: it would cast boxes */
+        for (int k = 0; k + 2 < b->count; k += 3) {
+            const float* v = g_verts + (size_t)(b->first + k) * VTX_FLOATS;
+            if (rt_tri_n + 1 > rt_tri_cap) { rt_tri_cap = (rt_tri_n + 1) * 2; rt_tri = realloc(rt_tri, rt_tri_cap * sizeof *rt_tri); }
+            RtTri* t = &rt_tri[rt_tri_n++];
+            for (int j = 0; j < 3; j++) memcpy(t->v + j * 3, v + j * VTX_FLOATS + 18, 3 * sizeof(float));
+            for (int c = 0; c < 3; c++) {
+                float a = t->v[c], bb = t->v[3 + c], cc = t->v[6 + c];
+                t->lo[c] = fminf(a, fminf(bb, cc)); t->hi[c] = fmaxf(a, fmaxf(bb, cc)); t->c[c] = (a + bb + cc) / 3.0f;
+            }
+            t->cut = -1;
+            if (!b->holes) continue;
+            if (rt_cuts_n + 1 > rt_cuts_cap) { rt_cuts_cap = (rt_cuts_n + 1) * 2; rt_cuts = realloc(rt_cuts, rt_cuts_cap * sizeof *rt_cuts); }
+            RtCut* c = &rt_cuts[rt_cuts_n];
+            for (int j = 0; j < 3; j++) { c->s[j] = v[j * VTX_FLOATS + 8]; c->t[j] = v[j * VTX_FLOATS + 9]; }
+            c->off = (float)b->mask_off; c->w = b->tw; c->h = b->th; c->wrap = (float)b->sampler;
+            t->cut = (float)rt_cuts_n++;
+        }
+    }
+    {   static int lg = -1; if (lg < 0) lg = getenv("DQIX_RT_LOG") != NULL;   /* tests: what the rays see */
+        if (lg && g_frame % 300 == 0)
+            fprintf(stderr, "rt: frame %llu triangles %zu cut-out %zu (masks %zu bytes)\n", (unsigned long long)g_frame, rt_tri_n, rt_cuts_n, rt_bits_n);
+    }
+    if (!rt_tri_n) return 0;
+    if (rt_tri_n * 4 > (size_t)rt_tbo_max) rt_tri_n = (size_t)rt_tbo_max / 4;   /* the nodes too must fit (2 a triangle, 2 texels each) */
+    double t0 = perf_ms();
+    rt_node = realloc(rt_node, sizeof *rt_node * rt_tri_n * 2);
+    rt_idx = realloc(rt_idx, sizeof *rt_idx * rt_tri_n);
+    for (size_t i = 0; i < rt_tri_n; i++) rt_idx[i] = (int)i;
+    rt_node_n = 1;
+    bvh_build(0, 0, (int)rt_tri_n, 0);
+    size_t need = (size_t)rt_node_n * 8 > rt_tri_n * 12 ? (size_t)rt_node_n * 8 : rt_tri_n * 12;
+    if (need > rt_up_cap) { rt_up_cap = need * 2; rt_up = realloc(rt_up, rt_up_cap * sizeof(float)); }
+    for (int i = 0; i < rt_node_n; i++) {
+        float* o = rt_up + (size_t)i * 8; const RtNode* n = &rt_node[i];
+        o[0] = n->lo[0]; o[1] = n->lo[1]; o[2] = n->lo[2]; o[3] = (float)n->first;
+        o[4] = n->hi[0]; o[5] = n->hi[1]; o[6] = n->hi[2]; o[7] = (float)n->count;
+    }
+    tbo_fill(0, rt_up, (size_t)rt_node_n * 8 * sizeof(float));
+    for (size_t i = 0; i < rt_tri_n; i++) {                    /* in the hierarchy's order */
+        float* o = rt_up + i * 12; const RtTri* t = &rt_tri[rt_idx[i]];
+        for (int j = 0; j < 3; j++) { memcpy(o + j * 4, t->v + j * 3, 3 * sizeof(float)); o[j * 4 + 3] = j ? 0 : t->cut; }
+    }
+    tbo_fill(1, rt_up, rt_tri_n * 12 * sizeof(float));
+    if (rt_cuts_n * 12 > rt_up_cap) { rt_up_cap = rt_cuts_n * 24; rt_up = realloc(rt_up, rt_up_cap * sizeof(float)); }
+    for (size_t i = 0; i < rt_cuts_n; i++) {
+        float* o = rt_up + i * 12; const RtCut* c = &rt_cuts[i];
+        o[0] = c->s[0]; o[1] = c->s[1]; o[2] = c->s[2]; o[3] = 0;
+        o[4] = c->t[0]; o[5] = c->t[1]; o[6] = c->t[2]; o[7] = 0;
+        o[8] = c->off; o[9] = c->w; o[10] = c->h; o[11] = c->wrap;
+    }
+    tbo_fill(2, rt_up, rt_cuts_n * 12 * sizeof(float));
+    tbo_fill(3, rt_bits, rt_bits_n);
+    p_glBindBuffer(GL_TEXTURE_BUFFER, 0);
+    {   static int lg = -1; if (lg < 0) lg = getenv("DQIX_RT_LOG") != NULL;
+        if (lg && g_frame % 300 == 0) fprintf(stderr, "rt: frame %llu nodes %d, built and sent in %.2f ms\n", (unsigned long long)g_frame, rt_node_n, perf_ms() - t0);
+    }
+    /* The game's own light if it lights its models with the DS's lights; DQIX
+     * doesn't (vertex colours, toon shading), so then a sun of our own: above,
+     * a little to the left and behind the camera (see metal_render.m). */
+    float az = g_look.sun_turn * 3.14159265f / 180.0f, el = g_look.sun_height * 3.14159265f / 180.0f;
+    float sun[3] = { cosf(el) * sinf(az), sinf(el), cosf(el) * cosf(az) }, sl = 0;   /* turn 0 = from behind the camera */
+    if (f->has_sun) memcpy(sun, f->sun, sizeof sun);
+    for (int c = 0; c < 3; c++) sl += sun[c] * sun[c];
+    sl = 1.0f / sqrtf(sl);
+    for (int c = 0; c < 3; c++) sun[c] *= sl;
+    p_glDisable(GL_DEPTH_TEST); p_glDisable(GL_STENCIL_TEST); p_glDisablei(GL_BLEND, 0);
+    pass_to(rt_raw_fbo, rt_w, rt_h, prog_trace);
+    GLuint P = prog_trace;
+    bind_tex(0, GL_TEXTURE_2D, fb->wdepth, 0);
+    for (int i = 0; i < 4; i++) bind_tex(1 + i, GL_TEXTURE_BUFFER, rt_tbo[i], 0);
+    p_glUniform1i(p_glGetUniformLocation(P, "u_gpos"), 0);
+    p_glUniform1i(p_glGetUniformLocation(P, "u_nodes"), 1);
+    p_glUniform1i(p_glGetUniformLocation(P, "u_tris"), 2);
+    p_glUniform1i(p_glGetUniformLocation(P, "u_cuts"), 3);
+    p_glUniform1i(p_glGetUniformLocation(P, "u_bits"), 4);
+    p_glUniform3fv(p_glGetUniformLocation(P, "u_sun"), 1, sun);
+    p_glUniform1i(p_glGetUniformLocation(P, "u_frame"), (GLint)(g_frameno & 0x7FFFFFFF));
+    p_glUniform1i(p_glGetUniformLocation(P, "u_has_sun"), 1);
+    p_glUniform1i(p_glGetUniformLocation(P, "u_ratio"), rt_ratio);
+    p_glUniform1f(p_glGetUniformLocation(P, "u_ao_r"), g_look.reach);
+    quad_draw(P);
+    unbind_units(5);
+    pass_to(rt_shade_fbo, rt_w, rt_h, prog_rtblur);
+    bind_tex(0, GL_TEXTURE_2D, rt_raw, 0);
+    p_glUniform1i(p_glGetUniformLocation(prog_rtblur, "u_raw"), 0);
+    p_glUniform1f(p_glGetUniformLocation(prog_rtblur, "u_sun_k"), g_look.shadow);
+    p_glUniform1f(p_glGetUniformLocation(prog_rtblur, "u_ao_k"), g_look.shading);
+    quad_draw(prog_rtblur);
+    return 1;
+}
+
+/* The HD-2D look on the finished 3D layer: post -> depth of field -> + bloom, grade, vignette -> hd2d.
+ * The colour goes through fb->color as scratch (the polygon pass is done with it). */
+static void hd2d_passes(Fb3D* fb) {
+    const GlLook* L = &g_look;
+    int W = 256 + 2 * g_wside;
+    p_glDisable(GL_DEPTH_TEST); p_glDisable(GL_STENCIL_TEST); p_glDisablei(GL_BLEND, 0);
+    int prev = focus_cur, cur = focus_cur ^ 1;
+    pass_to(focus_fbo[cur], 1, 1, prog_focus);
+    bind_tex(0, GL_TEXTURE_2D, fb->wdepth, 0); bind_tex(1, GL_TEXTURE_2D, focus_tex[prev], 0);
+    p_glUniform1i(p_glGetUniformLocation(prog_focus, "u_wd"), 0);
+    p_glUniform1i(p_glGetUniformLocation(prog_focus, "u_prev"), 1);
+    p_glUniform1f(p_glGetUniformLocation(prog_focus, "u_keep"), 0.85f);
+    quad_draw(prog_focus);
+    focus_cur = cur;
+    pass_to(fb->scratch_fbo, g_fb3_w, g_fb_h, prog_dof);
+    bind_tex(0, GL_TEXTURE_2D, fb->post, 0); bind_tex(1, GL_TEXTURE_2D, fb->wdepth, 0); bind_tex(2, GL_TEXTURE_2D, focus_tex[cur], 0);
+    p_glUniform1i(p_glGetUniformLocation(prog_dof, "u_col"), 0);
+    p_glUniform1i(p_glGetUniformLocation(prog_dof, "u_wd"), 1);
+    p_glUniform1i(p_glGetUniformLocation(prog_dof, "u_foc"), 2);
+    p_glUniform1f(p_glGetUniformLocation(prog_dof, "u_scale"), (float)g_scale);
+    p_glUniform1f(p_glGetUniformLocation(prog_dof, "u_blur"), L->blur);
+    p_glUniform1f(p_glGetUniformLocation(prog_dof, "u_focus"), L->focus);
+    p_glUniform1f(p_glGetUniformLocation(prog_dof, "u_band"), L->focus_band);
+    p_glUniform1f(p_glGetUniformLocation(prog_dof, "u_tilt"), L->tilt);
+    quad_draw(prog_dof);
+    unbind_units(3);
+    pass_to(bloom_fbo[0], W, 192, prog_bright);
+    bind_tex(0, GL_TEXTURE_2D, fb->color, smp_linear);
+    p_glUniform1i(p_glGetUniformLocation(prog_bright, "u_src"), 0);
+    p_glUniform1f(p_glGetUniformLocation(prog_bright, "u_scale"), (float)g_scale);
+    p_glUniform1f(p_glGetUniformLocation(prog_bright, "u_threshold"), L->bloom_threshold);
+    quad_draw(prog_bright);
+    for (int i = 1; i < BLOOM_LEVELS; i++) {
+        pass_to(bloom_fbo[i], W >> i, 192 >> i, prog_down);
+        bind_tex(0, GL_TEXTURE_2D, bloom_tex[i - 1], smp_linear);
+        p_glUniform1i(p_glGetUniformLocation(prog_down, "u_src"), 0);
+        quad_draw(prog_down);
+    }
+    p_glEnablei(GL_BLEND, 0);                                  /* added to what is there */
+    p_glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ONE);
+    p_glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+    for (int i = BLOOM_LEVELS - 2; i >= 0; i--) {
+        pass_to(bloom_fbo[i], W >> i, 192 >> i, prog_up);
+        bind_tex(0, GL_TEXTURE_2D, bloom_tex[i + 1], smp_linear);
+        p_glUniform1i(p_glGetUniformLocation(prog_up, "u_src"), 0);
+        quad_draw(prog_up);
+    }
+    p_glDisablei(GL_BLEND, 0);
+    pass_to(fb->hd2d_fbo, g_fb3_w, g_fb_h, prog_hd2d);
+    bind_tex(0, GL_TEXTURE_2D, fb->color, 0); bind_tex(1, GL_TEXTURE_2D, bloom_tex[0], smp_linear);
+    p_glUniform1i(p_glGetUniformLocation(prog_hd2d, "u_col"), 0);
+    p_glUniform1i(p_glGetUniformLocation(prog_hd2d, "u_bloom"), 1);
+    p_glUniform1f(p_glGetUniformLocation(prog_hd2d, "u_bloomk"), L->bloom);
+    p_glUniform1f(p_glGetUniformLocation(prog_hd2d, "u_warmth"), L->warmth);
+    p_glUniform1f(p_glGetUniformLocation(prog_hd2d, "u_vignette"), L->vignette);
+    quad_draw(prog_hd2d);
+    unbind_units(2);
+}
 
 static void gl_vblank(void) {
     g_fb_shown = g_fb_latest;                                  /* what was rendered last is visible now */
@@ -840,10 +1472,14 @@ static void gl_render_(const Frame3D* f) {
     int side = f->width > 256 ? (f->width - 256) / 2 : 0;
     if (side != g_wside) { free_fbs(); g_wside = side; make_fbs(); }   /* widescreen on/off: buffers of the new width */
     g_half_w = (float)(256 + 2 * side) / 2.0f;
+    int hd2d = g_hd2d && hd2d_ok, rt = g_rt && rt_ok;
+    if ((hd2d || rt) && !fx_on) make_fx();                     /* the effects' buffers only while one is on */
+    else if (!hd2d && !rt && fx_on) free_fx();
     uint16_t disp3d = IO16_(0x060);
     int textures_on = disp3d & 1;
     /* vertices + batches */
     int nv = 0, nb = 0;
+    rt_bits_n = 0; rt_bits_k = 0;
     for (int i = 0; i < f->n; i++) {
         const Poly* p = f->order[i];
         int fmt = (p->teximg >> 26) & 7;
@@ -855,7 +1491,9 @@ static void gl_render_(const Frame3D* f) {
         b.tex = white_tex; b.tw = 1; b.th = 1;
         if (textured) {
             int w, h;
-            b.tex = texture_for(p->teximg, p->pltt, &w, &h);
+            const uint8_t* mask;
+            b.tex = texture_for(p->teximg, p->pltt, &w, &h, &b.holes, &mask);
+            b.mask_off = b.holes && mask && rt ? rt_mask(mask, w, h) : -1;
             b.tw = (float)w; b.th = (float)h;
             int sm = (p->teximg >> 16) & 1 ? ((p->teximg >> 18) & 1 ? 2 : 1) : 0;
             int tm = (p->teximg >> 17) & 1 ? ((p->teximg >> 19) & 1 ? 2 : 1) : 0;
@@ -910,6 +1548,7 @@ static void gl_render_(const Frame3D* f) {
     p_glDepthMask(GL_TRUE);
     p_glClearBufferfv(GL_COLOR, 0, cc);
     p_glClearBufferfv(GL_COLOR, 1, cattr);
+    if (fx_on) { static const float far_[4] = { 0, 0, 0, 1e9f }; mask2(1); p_glClearBufferfv(GL_COLOR, 2, far_); }   /* nothing drawn: far away */
     p_glStencilMask(0xFF);
     p_glClearBufferfi(GL_DEPTH_STENCIL, 0, cd, ca > 0.0f ? ST_SOLID : 0);
 
@@ -958,7 +1597,7 @@ static void gl_render_(const Frame3D* f) {
         p_glDepthMask(b->depth_write ? GL_TRUE : GL_FALSE);
         GLenum prim = b->lines ? GL_LINES : GL_TRIANGLES;
         if (b->shadow == 1) {                                   /* shadow mask: no colour; mark where it fails the depth test */
-            p_glColorMaski(0, 0, 0, 0, 0); p_glColorMaski(1, 0, 0, 0, 0);
+            p_glColorMaski(0, 0, 0, 0, 0); p_glColorMaski(1, 0, 0, 0, 0); mask2(0);
             p_glDepthMask(GL_FALSE);
             p_glStencilMask(ST_MASKBIT);
             if (!in_mask) { GLint zero = 0; p_glClearBufferiv(GL_STENCIL, 0, &zero); }   /* a new mask: the old marks go */
@@ -972,7 +1611,7 @@ static void gl_render_(const Frame3D* f) {
         in_mask = 0;
         if (!b->translucent && !b->shadow) {
             p_glDisablei(GL_BLEND, 0);
-            p_glColorMaski(1, 1, 1, 1, 1);
+            p_glColorMaski(1, 1, 1, 1, 1); mask2(1);
             p_glStencilMask(0xFF);
             p_glStencilFunc(GL_ALWAYS, ST_SOLID, 0xFF);
             p_glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
@@ -985,7 +1624,7 @@ static void gl_render_(const Frame3D* f) {
         if (b->shadow != 2) {
             p_glUniform1i(loc_part, 1);
             p_glDisablei(GL_BLEND, 0);
-            p_glColorMaski(1, 1, 1, 1, 1);
+            p_glColorMaski(1, 1, 1, 1, 1); mask2(1);
             p_glDepthMask(GL_TRUE);
             p_glStencilMask(0xFF);
             p_glStencilFunc(GL_ALWAYS, ST_SOLID, 0xFF);
@@ -997,7 +1636,7 @@ static void gl_render_(const Frame3D* f) {
         GLint ref = ST_SOLID | ST_TRANS | (b->pid & ST_ID);
         /* translucent pixels keep the opaque polygon id; their fog flag is the pixel's AND the
          * polygon's (the DS): a polygon with fog leaves it as it was, one without clears it */
-        p_glColorMaski(1, 0, b->fog ? 0 : 1, 0, 0);
+        p_glColorMaski(1, 0, b->fog ? 0 : 1, 0, 0); mask2(0);
         if (b->shadow == 2) {                                   /* the shadow: only on marked pixels; clears the marks */
             if (blend_on) { p_glEnablei(GL_BLEND, 0); p_glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE); p_glBlendEquationSeparate(GL_FUNC_ADD, GL_MAX); }
             else p_glDisablei(GL_BLEND, 0);
@@ -1034,6 +1673,8 @@ static void gl_render_(const Frame3D* f) {
 
     p_glDisable(GL_DEPTH_TEST);
     p_glDepthMask(GL_TRUE);
+    mask2(1);
+    if (rt) rt = rt_passes(fb, f, nb);
 
     /* edge marking + fog -> post */
     p_glBindFramebuffer(GL_FRAMEBUFFER, fb->post_fbo);
@@ -1064,10 +1705,18 @@ static void gl_render_(const Frame3D* f) {
     p_glUniform1i(p_glGetUniformLocation(prog_post, "u_fogoff"), IO16_(0x35C) & 0x7FFF);
     p_glUniform1i(p_glGetUniformLocation(prog_post, "u_fogshift"), (disp3d >> 8) & 15);
     p_glUniform1i(p_glGetUniformLocation(prog_post, "u_wbuf"), f->wbuf);
+    {   static int dbg = -1; if (dbg < 0) dbg = getenv("DQIX_RT_DEBUG") != NULL;   /* tests: the shade alone */
+        p_glUniform1i(p_glGetUniformLocation(prog_post, "u_rt"), rt ? 1 + dbg : 0); }
+    if (rt) {
+        p_glActiveTexture(GL_TEXTURE3); p_glBindTexture(GL_TEXTURE_2D, rt_shade);
+        p_glUniform1i(p_glGetUniformLocation(prog_post, "u_shade"), 3);
+    }
     p_glUniform4f(p_glGetUniformLocation(prog_post, "u_rect"), -1, -1, 2, 2);
     p_glUniform4f(p_glGetUniformLocation(prog_post, "u_uv"), 0, 0, 1, 1);
     p_glBindVertexArray(vao_quad);
     p_glDrawArrays(GL_TRIANGLES, 0, 6);
+    fb->hd2d_valid = 0;
+    if (hd2d) { hd2d_passes(fb); fb->hd2d_valid = 1; }
     p_glActiveTexture(GL_TEXTURE0);
     p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
     fb->valid = 1;
@@ -1123,7 +1772,8 @@ void gl_compose(int a_on_top, int lcd_on) {
         p_glActiveTexture(GL_TEXTURE0); p_glBindTexture(GL_TEXTURE_2D, tex_col[eng]);
         p_glActiveTexture(GL_TEXTURE1); p_glBindTexture(GL_TEXTURE_2D, tex_c2);
         p_glActiveTexture(GL_TEXTURE2); p_glBindTexture(GL_TEXTURE_2D, tex_info);
-        p_glActiveTexture(GL_TEXTURE3); p_glBindTexture(GL_TEXTURE_2D, has3d ? g_fb[g_fb_shown].post : white_tex);
+        const Fb3D* sf = has3d ? &g_fb[g_fb_shown] : NULL;
+        p_glActiveTexture(GL_TEXTURE3); p_glBindTexture(GL_TEXTURE_2D, !sf ? white_tex : sf->hd2d_valid ? sf->hd2d : sf->post);
         p_glUniform1i(loc_has3d, eng == 0 && has3d);
         int wide = eng == 0 && has3d && g_wside > 0;                 /* the 3D screen, widened; the other in the middle */
         p_glUniform1i(loc_wide, wide);
@@ -1314,11 +1964,15 @@ int gl_read_3d(uint8_t* out, int* w, int* h) {
  * none) and the DS pixels added each side. */
 int gl_wide_shown(int* side) { *side = g_wside; return g_wide_shown; }
 
-/* The extra looks (gl_render.h) are Metal only for now. */
-int gl_effects(void) { return 0; }
-void gl_set_hd2d(int on) { (void)on; }
-void gl_set_rt(int on) { (void)on; }
-void gl_set_look(const GlLook* look) { (void)look; }
+/* The extra looks (gl_render.h): what this driver can do, and switching them. */
+int gl_effects(void) { return (hd2d_ok ? GL_EFFECT_HD2D : 0) | (rt_ok ? GL_EFFECT_RT : 0); }
+void gl_set_hd2d(int on) { g_hd2d = on != 0; }
+void gl_set_rt(int on) { g_rt = on != 0; }
+void gl_set_look(const GlLook* l) {
+    int res = l->rt_res != g_look.rt_res;
+    g_look = *l;
+    if (res && g_ready && fx_on) { make_rt_tex(); }             /* a new ray resolution: its textures */
+}
 
 /* ---------------------------------------------------------------- windows */
 /* One context for every window: the first window's. */
@@ -1348,7 +2002,7 @@ int gfx_attach(SDL_Window* win) {
 
 void gfx_detach(SDL_Window* win) {
     if (!g_ctx) return;
-    if (win == g_ctx_win) { SDL_GL_DeleteContext(g_ctx); g_ctx = NULL; g_ctx_win = NULL; g_ready = 0; return; }
+    if (win == g_ctx_win) { SDL_GL_DeleteContext(g_ctx); g_ctx = NULL; g_ctx_win = NULL; g_ready = 0; fx_on = 0; return; }
     SDL_GL_MakeCurrent(g_ctx_win, g_ctx);
 }
 

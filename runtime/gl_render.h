@@ -54,9 +54,10 @@ typedef struct { double render_ms, upload_ms; int uploads, polys; long upload_te
 extern GlStats g_gl_stats;
 const char* gl_renderer_name(void);
 
-/* Extra looks beyond the DS's (Metal only for now): which this renderer has, and switching them. */
+/* Extra looks beyond the DS's, off at first: which this renderer has, and
+ * switching them. Off, the frames are exactly as without them. */
 #define GL_EFFECT_HD2D 1                                      /* depth of field, bloom, a warm grade */
-#define GL_EFFECT_RT 2                                        /* ray-traced shadows and occlusion (GPUs that trace rays) */
+#define GL_EFFECT_RT 2                                        /* ray-traced shadows and occlusion (Metal: GPUs that trace rays; GL: in shaders) */
 int gl_effects(void);
 void gl_set_hd2d(int on);
 void gl_set_rt(int on);

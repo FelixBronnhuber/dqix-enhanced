@@ -17,10 +17,12 @@ news, and friends to play with.
 > (`runtime/metal_render.m`, same output as the OpenGL one) and a **Cocoa
 > menu bar**. Enhanced mode also gets two optional effects that are off by
 > default: an **HD-2D look** (tilt-shift depth of field, glow, warm grade,
-> vignette) and **ray-traced sun shadows and shading** (Metal ray tracing).
-> Both can be tuned live in *Graphics > Effect settings…*. Expect rough edges.
-> The Windows build of the shared changes is untested. Building is covered under
-> [Getting started](#getting-started).
+> vignette) and **ray-traced sun shadows and shading** (Metal ray tracing on
+> the Mac; on Windows and Linux the OpenGL renderer traces the rays in its
+> shaders). Both can be tuned live in *Graphics > Effect settings…* (Mac,
+> Windows); Ctrl+H and Ctrl+L switch them anywhere, and on Linux the sliders
+> are the `fx_*` lines in settings.ini. Off, the frames are exactly as before.
+> Expect rough edges. Building is covered under [Getting started](#getting-started).
 >
 > ![HD-2D look with ray-traced shadows and the Effect settings window](docs/images/macos-hd2d-rt.jpg)
 
@@ -42,9 +44,10 @@ news, and friends to play with.
   colours, pixel grid, motion blur and backlight levels, and the screens
   inside a photo of a real DS Lite (or a drawn one in six colours), even at
   actual size. F6 switches the screen filter, F7 the console.
-- **HD-2D look and ray-traced lighting** (Mac, Graphics menu): depth of
-  field, glow and warm colours like the HD-2D games, and soft shadows and
-  shading in corners traced on the GPU. Both off at first.
+- **HD-2D look and ray-traced lighting** (Enhanced, Graphics menu, or
+  Ctrl+H / Ctrl+L): depth of field, glow and warm colours like the HD-2D
+  games, and soft shadows and shading in corners traced on the GPU. Both off
+  at first.
 - Any window size, fullscreen, screens stacked or side by side, and sharp
   pixel scaling. F9 swaps the screens.
 - **Two windows**, one screen in each, for two monitors, each one

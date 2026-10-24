@@ -10,6 +10,8 @@
 #include <wchar.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
+#include <math.h>
 
 static HWND g_hwnd;
 static HMENU g_bar;
@@ -57,6 +59,10 @@ void menu_init(SDL_Window* win, const char* const* shell_names, int n_shells) {
     sep(res);
     item(res, MI_RES_AUTO, L"&Auto: as sharp as your screen (up to 12x)");
     item(gfx, MI_SMOOTH, L"&Smooth textures (Enhanced)");
+    sep(gfx);
+    item(gfx, MI_HD2D, L"&HD-2D look: depth of field, glow, warm colours (Enhanced)\tCtrl+H");
+    item(gfx, MI_RT, L"Ray-traced shadows and shading (Enhanced)\tCtrl+&L");
+    item(gfx, MI_EFFECTS, L"Effect se&ttings...");
 
     HMENU scr = sub(g_bar, L"&Screen");
     item(scr, MI_LCD, L"&DS Lite screen\tF6");
@@ -698,10 +704,162 @@ void session_window_close(void) {
     DestroyWindow(g_ses);
     g_ses = NULL;
 }
-void effects_window_open(SDL_Window* win, GlLook* look, const GlLook* defaults, int* hd2d, int* rt, int rt_available) {
-    (void)win; (void)look; (void)defaults; (void)hd2d; (void)rt; (void)rt_available;
+
+/* ---------------------------------------------------------------- Graphics > Effect settings: sliders for the HD-2D look and the ray tracing, live */
+#define ID_FX_RT 4200
+#define ID_FX_HD2D 4201
+#define ID_FX_RES 4202
+#define ID_FX_DEFAULTS 4203
+#define ID_FX_BAR 4300                                         /* + row */
+#define ID_FX_VALUE 4400                                       /* + row */
+#define FX_STEPS 1000                                          /* slider positions */
+static HWND g_fx;
+static GlLook* g_fx_look; static const GlLook* g_fx_defaults;
+static int *g_fx_hd2d, *g_fx_rt; static int g_fx_rt_ok;
+typedef struct { const wchar_t* name; size_t at; float lo, hi; const char* fmt; int rt; } FxRow;
+static const FxRow FX_ROWS[] = {                               /* as menu_cocoa.m */
+    { L"Shadow darkness", offsetof(GlLook, shadow), 0, 1, "%.0f%%", 1 },
+    { L"Shading in corners", offsetof(GlLook, shading), 0, 1, "%.0f%%", 1 },
+    { L"Shading reach", offsetof(GlLook, reach), 0.02f, 0.25f, "%.2f", 1 },
+    { L"Sun: turn", offsetof(GlLook, sun_turn), -180, 180, "%.0f\xc2\xb0", 1 },
+    { L"Sun: height", offsetof(GlLook, sun_height), 10, 90, "%.0f\xc2\xb0", 1 },
+    { L"Glow", offsetof(GlLook, bloom), 0, 2, "%.2f", 0 },
+    { L"Glow from brightness", offsetof(GlLook, bloom_threshold), 0.4f, 1, "%.2f", 0 },
+    { L"Blur (depth of field)", offsetof(GlLook, blur), 0, 2, "%.2f", 0 },
+    { L"Focus distance", offsetof(GlLook, focus), 0.5f, 2, "%.2fx", 0 },
+    { L"Sharp zone", offsetof(GlLook, focus_band), 0, 0.6f, "%.2f", 0 },
+    { L"Tilt-shift", offsetof(GlLook, tilt), 0, 2, "%.2f", 0 },
+    { L"Warm colours", offsetof(GlLook, warmth), 0, 2, "%.2f", 0 },
+    { L"Vignette", offsetof(GlLook, vignette), 0, 0.8f, "%.2f", 0 },
+};
+#define FX_N ((int)(sizeof FX_ROWS / sizeof FX_ROWS[0]))
+#define FX_FIRST_HD2D 5                                        /* the rows before it: the ray tracing */
+static const float FX_RES[4] = { 0.5f, 1.0f, 1.5f, 2.0f };
+
+static float* fx_field(int i) { return (float*)((char*)g_fx_look + FX_ROWS[i].at); }
+static int fx_pos(int i) {
+    float t = (*fx_field(i) - FX_ROWS[i].lo) / (FX_ROWS[i].hi - FX_ROWS[i].lo);
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    return (int)(t * FX_STEPS + 0.5f);
 }
-void effects_window_refresh(void) {}
+static void fx_show_value(int i) {
+    float v = *fx_field(i);
+    if (strstr(FX_ROWS[i].fmt, "%%")) v *= 100.0f;            /* shown as a percentage */
+    char t[32]; snprintf(t, sizeof t, FX_ROWS[i].fmt, v);
+    wchar_t w[32]; MultiByteToWideChar(CP_UTF8, 0, t, -1, w, 32);
+    SetDlgItemTextW(g_fx, ID_FX_VALUE + i, w);
+}
+
+static INT_PTR CALLBACK fx_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_INITDIALOG: {
+        HWND res = GetDlgItem(h, ID_FX_RES);
+        SendMessageW(res, CB_ADDSTRING, 0, (LPARAM)L"Half a ray a DS pixel (fastest)");
+        SendMessageW(res, CB_ADDSTRING, 0, (LPARAM)L"1 ray a DS pixel");
+        SendMessageW(res, CB_ADDSTRING, 0, (LPARAM)L"1.5 rays a DS pixel");
+        SendMessageW(res, CB_ADDSTRING, 0, (LPARAM)L"2 rays a DS pixel (sharpest)");
+        for (int i = 0; i < FX_N; i++) {
+            SCROLLINFO si = { sizeof si, SIF_RANGE | SIF_PAGE, 0, FX_STEPS + 19, 20, 0, 0 };
+            SetScrollInfo(GetDlgItem(h, ID_FX_BAR + i), SB_CTL, &si, FALSE);
+        }
+        return TRUE;
+    }
+    case WM_HSCROLL: {
+        int i = GetDlgCtrlID((HWND)lp) - ID_FX_BAR;
+        if (i < 0 || i >= FX_N) return FALSE;
+        HWND bar = (HWND)lp;
+        SCROLLINFO si = { sizeof si, SIF_POS | SIF_TRACKPOS, 0, 0, 0, 0, 0 };
+        GetScrollInfo(bar, SB_CTL, &si);
+        int v = si.nPos;
+        switch (LOWORD(wp)) {
+        case SB_LINELEFT: v -= 10; break; case SB_LINERIGHT: v += 10; break;
+        case SB_PAGELEFT: v -= 100; break; case SB_PAGERIGHT: v += 100; break;
+        case SB_LEFT: v = 0; break; case SB_RIGHT: v = FX_STEPS; break;
+        case SB_THUMBTRACK: case SB_THUMBPOSITION: v = si.nTrackPos; break;
+        default: return TRUE;
+        }
+        v = v < 0 ? 0 : v > FX_STEPS ? FX_STEPS : v;
+        SetScrollPos(bar, SB_CTL, v, TRUE);
+        *fx_field(i) = FX_ROWS[i].lo + (FX_ROWS[i].hi - FX_ROWS[i].lo) * (float)v / FX_STEPS;   /* the frontend picks it up next frame */
+        fx_show_value(i);
+        return TRUE;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case ID_FX_RT: *g_fx_rt = IsDlgButtonChecked(h, ID_FX_RT) == BST_CHECKED; return TRUE;
+        case ID_FX_HD2D: *g_fx_hd2d = IsDlgButtonChecked(h, ID_FX_HD2D) == BST_CHECKED; return TRUE;
+        case ID_FX_RES:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                int k = (int)SendDlgItemMessageW(h, ID_FX_RES, CB_GETCURSEL, 0, 0);
+                if (k >= 0 && k < 4) g_fx_look->rt_res = FX_RES[k];
+            }
+            return TRUE;
+        case ID_FX_DEFAULTS: *g_fx_look = *g_fx_defaults; effects_window_refresh(); return TRUE;
+        case IDOK: case IDCANCEL: DestroyWindow(h); g_fx = NULL; return TRUE;
+        }
+        break;
+    case WM_CLOSE: DestroyWindow(h); g_fx = NULL; return TRUE;
+    }
+    return FALSE;
+}
+
+void effects_window_open(SDL_Window* win, GlLook* look, const GlLook* defaults, int* hd2d, int* rt, int rt_available) {
+    g_fx_look = look; g_fx_defaults = defaults; g_fx_hd2d = hd2d; g_fx_rt = rt; g_fx_rt_ok = rt_available;
+    if (g_fx) { effects_window_refresh(); SetForegroundWindow(g_fx); return; }
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(win, &info) || info.subsystem != SDL_SYSWM_WINDOWS) return;
+    static WORD buf[8192];
+    memset(buf, 0, sizeof buf);
+    DLGTEMPLATE* d = (DLGTEMPLATE*)align4(buf);
+    const short W = 262, row = 15, lx = 18, bx = 106, bw = 108, vx = 220;
+    short h = (short)(7 + 15 + 17 + FX_FIRST_HD2D * row + 8 + 15 + (FX_N - FX_FIRST_HD2D) * row + 10 + 15 + 7);
+    d->style = DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE;
+    d->cdit = (WORD)(4 + 3 * FX_N + 2); d->cx = W; d->cy = h;
+    WORD* p = (WORD*)(d + 1);
+    *p++ = 0; *p++ = 0;
+    p = put_str(p, L"Effect settings");
+    *p++ = 9; p = put_str(p, L"Segoe UI");
+    short y = 7;
+    p = put_item(p, WS_TABSTOP | BS_AUTOCHECKBOX, 7, y, 200, 12, ID_FX_RT, 0x80, L"Ray-traced shadows and shading");
+    y += 15;
+    p = put_item(p, 0, lx, (short)(y + 2), 84, 9, 0xFFFF, 0x82, L"Resolution");
+    p = put_item(p, WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, bx, y, 148, 70, ID_FX_RES, 0x85, L"");
+    y += 17;
+    for (int i = 0; i < FX_N; i++) {
+        if (i == FX_FIRST_HD2D) {
+            y += 8;
+            p = put_item(p, WS_TABSTOP | BS_AUTOCHECKBOX, 7, y, 200, 12, ID_FX_HD2D, 0x80, L"HD-2D look");
+            y += 15;
+        }
+        p = put_item(p, 0, lx, (short)(y + 1), 86, 9, 0xFFFF, 0x82, FX_ROWS[i].name);
+        p = put_item(p, WS_TABSTOP | SBS_HORZ, bx, y, bw, 11, (WORD)(ID_FX_BAR + i), 0x84, L"");
+        p = put_item(p, 0, vx, (short)(y + 1), 36, 9, (WORD)(ID_FX_VALUE + i), 0x82, L"");
+        y += row;
+    }
+    y += 10;
+    p = put_item(p, WS_TABSTOP | BS_PUSHBUTTON, 7, y, 76, 15, ID_FX_DEFAULTS, 0x80, L"Restore defaults");
+    p = put_item(p, WS_TABSTOP | BS_DEFPUSHBUTTON, (short)(W - 7 - 54), y, 54, 15, IDOK, 0x80, L"Close");
+    g_fx = CreateDialogIndirectParamW(GetModuleHandleW(NULL), d, info.info.win.window, fx_proc, 0);
+    effects_window_refresh();
+}
+
+void effects_window_refresh(void) {
+    if (!g_fx || !g_fx_look) return;
+    CheckDlgButton(g_fx, ID_FX_RT, *g_fx_rt ? BST_CHECKED : BST_UNCHECKED);
+    EnableWindow(GetDlgItem(g_fx, ID_FX_RT), g_fx_rt_ok != 0);
+    CheckDlgButton(g_fx, ID_FX_HD2D, *g_fx_hd2d ? BST_CHECKED : BST_UNCHECKED);
+    int r = 2;
+    for (int k = 0; k < 4; k++) if (fabsf(g_fx_look->rt_res - FX_RES[k]) < 0.01f) r = k;
+    SendDlgItemMessageW(g_fx, ID_FX_RES, CB_SETCURSEL, (WPARAM)r, 0);
+    EnableWindow(GetDlgItem(g_fx, ID_FX_RES), g_fx_rt_ok != 0);
+    for (int i = 0; i < FX_N; i++) {
+        HWND bar = GetDlgItem(g_fx, ID_FX_BAR + i);
+        SetScrollPos(bar, SB_CTL, fx_pos(i), TRUE);
+        EnableWindow(bar, !FX_ROWS[i].rt || g_fx_rt_ok);
+        fx_show_value(i);
+    }
+}
 #else
 int choice_box(SDL_Window* win, const char* title, const char* text, const char* const* buttons, int n, int def, int cancel,
                const char* check, int* checked) { (void)win; (void)title; (void)text; (void)buttons; (void)n; (void)def; (void)cancel; (void)check; (void)checked; return -1; }
