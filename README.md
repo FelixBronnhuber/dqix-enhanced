@@ -12,6 +12,18 @@ exactly like the original, and it can also do things the DS never could.
 **Join the community on Discord: https://discord.gg/CczgRv36NK** for help,
 news, and friends to play with.
 
+> **This fork: macOS / Apple Silicon port (work in progress).**
+> A native build for M-series Macs with a **Metal renderer**
+> (`runtime/metal_render.m`, same output as the OpenGL one) and a **Cocoa
+> menu bar**. Enhanced mode also gets two optional effects that are off by
+> default: an **HD-2D look** (tilt-shift depth of field, glow, warm grade,
+> vignette) and **ray-traced sun shadows and shading** (Metal ray tracing).
+> Both can be tuned live in *Graphics > Effect settings…*. Expect rough edges.
+> The Windows build of the shared changes is untested. Building is covered under
+> [Getting started](#getting-started).
+>
+> ![HD-2D look with ray-traced shadows and the Effect settings window](docs/images/macos-hd2d-rt.jpg)
+
 ## Features
 
 **The game as it was**
